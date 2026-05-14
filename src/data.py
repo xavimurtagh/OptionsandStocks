@@ -59,21 +59,33 @@ def load_fred(series: dict[str, str], start: str, end: str | None = None,
 
 
 _COT_URL = "https://www.cftc.gov/files/dea/history/fut_disagg_txt_{year}.zip"
-_COT_COLS = {
-    "Report_Date_as_YYYY-MM-DD": "report_date",
-    "CFTC_Contract_Market_Code": "cftc_code",
-    "Open_Interest_All": "oi",
-    "M_Money_Positions_Long_All": "mm_long",
-    "M_Money_Positions_Short_All": "mm_short",
-    "Prod_Merc_Positions_Long_All": "comm_long",
-    "Prod_Merc_Positions_Short_All": "comm_short",
-    "Swap_Positions_Long_All": "swap_long",
-    "Swap_Positions_Short_All": "swap_short",
+
+# CFTC column names drift between years (whitespace, double underscores,
+# date format). Normalize to lowercase-alphanumeric and look up via this map.
+_COT_FIELD_ALIASES = {
+    "report_date": [
+        "reportdateasyyyymmdd", "reportdateasmmddyyyy", "reportdate",
+    ],
+    "cftc_code": ["cftccontractmarketcode"],
+    "oi": ["openinterestall"],
+    "mm_long": ["mmoneypositionslongall"],
+    "mm_short": ["mmoneypositionsshortall"],
+    "comm_long": ["prodmercpositionslongall"],
+    "comm_short": ["prodmercpositionsshortall"],
+    "swap_long": ["swappositionslongall"],
+    "swap_short": ["swappositionsshortall"],
 }
 
 
+def _normalize(s: str) -> str:
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+_COT_CACHE_VERSION = 2
+
+
 def _fetch_cot_year(year: int) -> pd.DataFrame:
-    cache = _cache_path(f"cot_{year}")
+    cache = _cache_path(f"cot_v{_COT_CACHE_VERSION}_{year}")
     if cache.exists() and year < pd.Timestamp.today().year:
         return pd.read_parquet(cache)
     r = requests.get(_COT_URL.format(year=year), timeout=60)
@@ -82,9 +94,19 @@ def _fetch_cot_year(year: int) -> pd.DataFrame:
         name = next(n for n in zf.namelist() if n.lower().endswith(".txt"))
         with zf.open(name) as fh:
             df = pd.read_csv(fh, low_memory=False)
-    keep = [c for c in _COT_COLS if c in df.columns]
-    df = df[keep].rename(columns=_COT_COLS)
-    df["report_date"] = pd.to_datetime(df["report_date"])
+    norm_to_orig = {_normalize(c): c for c in df.columns}
+    rename, missing = {}, []
+    for target, aliases in _COT_FIELD_ALIASES.items():
+        src = next((norm_to_orig[a] for a in aliases if a in norm_to_orig), None)
+        if src is None:
+            missing.append(target)
+        else:
+            rename[src] = target
+    df = df[list(rename)].rename(columns=rename)
+    for col in missing:
+        df[col] = pd.NA
+    df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce")
+    df = df.dropna(subset=["report_date"])
     df["cftc_code"] = df["cftc_code"].astype(str).str.zfill(6)
     df.to_parquet(cache)
     return df
