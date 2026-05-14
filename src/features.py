@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .config import AssetConfig, RunConfig
+from .config import AssetConfig, IntradayHorizon, RunConfig
 
 
 def _zscore(s: pd.Series, window: int) -> pd.Series:
@@ -19,6 +19,7 @@ def _price_features(close: pd.Series) -> pd.DataFrame:
         out[f"ret_{w}d"] = close.pct_change(w, fill_method=None)
     for w in (20, 60):
         out[f"rv_{w}d"] = r1.rolling(w).std() * np.sqrt(252)
+    out["vol_regime"] = out["rv_20d"] / out["rv_60d"]
     out["z_50"] = _zscore(close, 50)
     out["z_200"] = _zscore(close, 200)
     out["mom_skew"] = r1.rolling(60).skew()
@@ -37,11 +38,15 @@ def _macro_features(prices: pd.DataFrame, fred: pd.DataFrame,
         out[f"{label}_ret_20d"] = s.pct_change(20, fill_method=None)
         out[f"{label}_z_60"] = _zscore(s, 60)
     if not fred.empty:
-        fred_d = fred.reindex(prices.index).ffill()
-        for col in fred_d.columns:
-            out[f"fred_{col}_lvl"] = fred_d[col]
-            out[f"fred_{col}_chg_5d"] = fred_d[col].diff(5)
-            out[f"fred_{col}_chg_20d"] = fred_d[col].diff(20)
+        f = fred.reindex(prices.index).ffill()
+        for col in f.columns:
+            out[f"fred_{col}_lvl"] = f[col]
+            out[f"fred_{col}_chg_5d"] = f[col].diff(5)
+            out[f"fred_{col}_chg_20d"] = f[col].diff(20)
+        if {"real_yield_10y", "nominal_yield_10y"}.issubset(f.columns):
+            be = f["nominal_yield_10y"] - f["real_yield_10y"]
+            out["breakeven_10y"] = be
+            out["breakeven_10y_chg_20d"] = be.diff(20)
     return out
 
 
@@ -77,7 +82,8 @@ def _ratio_features(prices: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def build_features(data: dict, asset: AssetConfig, cfg: RunConfig) -> pd.DataFrame:
+def build_daily_features(data: dict, asset: AssetConfig,
+                         cfg: RunConfig) -> pd.DataFrame:
     prices = data["prices"]
     fred = data["fred"]
     cot = data["cot"]
@@ -88,11 +94,50 @@ def build_features(data: dict, asset: AssetConfig, cfg: RunConfig) -> pd.DataFra
     feats = feats.join(_ratio_features(prices))
     feats = feats.join(_cot_features(cot, asset.cftc_code, prices.index))
 
-    fwd = close.shift(-cfg.horizon) / close - 1.0
-    feats["target_ret"] = fwd
-    feats["target_up"] = (fwd > 0).astype(int)
+    for h in cfg.daily_horizons:
+        fwd = close.shift(-h) / close - 1.0
+        feats[f"target_ret_{h}d"] = fwd
+        feats[f"target_up_{h}d"] = (fwd > 0).astype(float)
+        feats.loc[fwd.isna(), f"target_up_{h}d"] = np.nan
     feats["close"] = close
-    # Keep rows whose features are populated; target may be NaN for the last
-    # `horizon` rows (unknown forward return) — useful for live prediction.
-    feat_cols = [c for c in feats.columns if c not in {"target_ret", "target_up", "close"}]
-    return feats.dropna(subset=feat_cols).copy()
+    return feats[feats["close"].notna()].copy()
+
+
+def build_intraday_features(bars: pd.DataFrame,
+                            h: IntradayHorizon) -> pd.DataFrame:
+    if bars.empty:
+        return bars
+    close = bars["close"]
+    out = pd.DataFrame(index=bars.index)
+    r1 = close.pct_change(fill_method=None)
+    for w in (1, 2, 4, 8, 20, 40):
+        out[f"ret_{w}b"] = close.pct_change(w, fill_method=None)
+    for w in (20, 50):
+        out[f"rv_{w}b"] = r1.rolling(w).std()
+    out["vol_regime"] = out["rv_20b"] / out["rv_50b"]
+
+    typical = (bars["high"] + bars["low"] + bars["close"]) / 3.0
+    vol = bars["volume"].astype(float).replace(0, np.nan)
+    vwap = (typical * vol).rolling(20).sum() / vol.rolling(20).sum()
+    out["vwap_dev"] = (close - vwap) / vwap
+
+    rng = (bars["high"] - bars["low"]) / close
+    out["range"] = rng
+    out["range_mean_20"] = rng.rolling(20).mean()
+
+    hod = bars.index.hour + bars.index.minute / 60.0
+    out["hod_sin"] = np.sin(2 * np.pi * hod / 24.0)
+    out["hod_cos"] = np.cos(2 * np.pi * hod / 24.0)
+    out["dow"] = bars.index.dayofweek
+
+    fwd = close.shift(-h.forward_bars) / close - 1.0
+    out["target_ret"] = fwd
+    out["target_up"] = (fwd > 0).astype(float)
+    out.loc[fwd.isna(), "target_up"] = np.nan
+    out["close"] = close
+    return out[out["close"].notna()].copy()
+
+
+# Backwards-compat alias for any imports that still expect `build_features`.
+def build_features(data: dict, asset: AssetConfig, cfg: RunConfig) -> pd.DataFrame:
+    return build_daily_features(data, asset, cfg)

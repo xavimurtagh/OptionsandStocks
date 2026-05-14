@@ -136,3 +136,18 @@ def load_all(cfg: RunConfig, assets: dict) -> dict[str, pd.DataFrame]:
     fred = load_fred(cfg.fred_series, cfg.start, cfg.end)
     cot = load_cot([a.cftc_code for a in assets.values()], cfg.start, cfg.end)
     return {"prices": prices, "fred": fred, "cot": cot}
+
+
+def load_intraday(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    df = yf.download(ticker, interval=interval, period=period,
+                     auto_adjust=True, progress=False, threads=False)
+    if df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df.columns = ["open", "high", "low", "close", "volume"]
+    df.index = pd.to_datetime(df.index)
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_convert("UTC").tz_localize(None)
+    return df.dropna(subset=["close"])
