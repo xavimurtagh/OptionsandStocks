@@ -30,13 +30,14 @@ class IntradayHorizon:
     forward_bars: int   # how many bars forward we predict
     train_min_bars: int
     step_bars: int
+    bars_per_year: int  # for annualizing Sharpe
 
 
 INTRADAY_HORIZONS = [
     IntradayHorizon("1h", "60m", "2y", forward_bars=4,
-                    train_min_bars=600, step_bars=80),
+                    train_min_bars=600, step_bars=80, bars_per_year=1638),
     IntradayHorizon("15m", "15m", "60d", forward_bars=8,
-                    train_min_bars=400, step_bars=60),
+                    train_min_bars=400, step_bars=60, bars_per_year=6552),
 ]
 
 
@@ -49,6 +50,8 @@ class RunConfig:
     n_ensemble: int = 5
     kelly_fraction: float = 0.25
     confidence_threshold: float = 0.15
+    cost_bps: float = 2.0      # round-trip transaction cost per unit turnover
+    device: str = "auto"       # auto | cpu | gpu | cuda  (LightGBM device_type)
     daily_horizons: list = field(default_factory=lambda: [5, 10, 20])
     intraday_horizons: list = field(default_factory=lambda: list(INTRADAY_HORIZONS))
     backtest_horizon: int = 5  # which daily horizon to use for backtest PnL

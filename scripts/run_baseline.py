@@ -57,21 +57,19 @@ def run_daily(name: str, data: dict, cfg: RunConfig) -> dict:
     bt = walk_forward_daily(feats, cfg)
     summary = {"empty": True}
     if not bt.empty:
-        summary = evaluate(bt, cfg, bars_per_year=252 // cfg.backtest_horizon)
-        bt["position"] = kelly_size(
-            bt["prob_up"].values, bt["confidence"].values,
-            cfg.kelly_fraction, cfg.confidence_threshold,
-        )
-        bt.to_parquet(ART_DIR / f"daily_predictions_{name}.parquet")
+        summary, enriched = evaluate(bt, cfg, holding=cfg.backtest_horizon,
+                                     periods_per_year=252)
+        enriched.to_parquet(ART_DIR / f"daily_predictions_{name}.parquet")
         print("-- strategy --", summary["strategy"])
         print("-- benchmark --", summary["benchmark"])
         print(f"hit={summary['hit_rate']:.3f} brier={summary['brier']:.3f} "
-              f"log_loss={summary['log_loss']:.3f} n_trades={summary['n_trades']}")
+              f"log_loss={summary['log_loss']:.3f} n_active={summary['n_active']}")
         print(summary["by_confidence"])
 
     labeled = feats.dropna(subset=[f"target_up_{cfg.backtest_horizon}d"])
     models = train_multi_horizon(
-        labeled, cfg.daily_horizons, "target_up_{h}d", n_models=cfg.n_ensemble
+        labeled, cfg.daily_horizons, "target_up_{h}d",
+        n_models=cfg.n_ensemble, device=cfg.device,
     )
     latest_signal = {}
     if models:
@@ -115,17 +113,15 @@ def run_intraday(name: str, cfg: RunConfig) -> dict:
         bt = walk_forward_intraday(feats, h, cfg)
         summary = {"empty": True}
         if not bt.empty:
-            summary = evaluate(bt, cfg, bars_per_year=h.forward_bars * 250)
-            bt["position"] = kelly_size(
-                bt["prob_up"].values, bt["confidence"].values,
-                cfg.kelly_fraction, cfg.confidence_threshold,
-            )
-            bt.to_parquet(ART_DIR / f"intraday_predictions_{name}_{h.label}.parquet")
+            summary, enriched = evaluate(bt, cfg, holding=h.forward_bars,
+                                         periods_per_year=h.bars_per_year)
+            enriched.to_parquet(ART_DIR / f"intraday_predictions_{name}_{h.label}.parquet")
             print("-- strategy --", summary["strategy"])
             print("-- benchmark --", summary["benchmark"])
 
         labeled = feats.dropna(subset=["target_up"])
-        models = train_multi_horizon(labeled, [h.label], "target_up", n_models=cfg.n_ensemble)
+        models = train_multi_horizon(labeled, [h.label], "target_up",
+                                     n_models=cfg.n_ensemble, device=cfg.device)
         latest = {}
         if models:
             last_row = feats.iloc[[-1]]

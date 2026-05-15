@@ -13,9 +13,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
-ART_DIR = Path(__file__).resolve().parent / "artifacts"
-ASSETS = ["gold", "silver"]
+ROOT = Path(__file__).resolve().parent
+ART_DIR = ROOT / "artifacts"
+TICKERS = {"gold": "GLD", "silver": "SLV"}
 INTRADAY_LABELS = ["1h", "15m"]
 
 
@@ -37,10 +39,28 @@ def _load_parquet(path: Path) -> pd.DataFrame | None:
         return None
 
 
-def _direction_label(prob_up: float, threshold: float = 0.5) -> str:
-    if prob_up > threshold + 0.05:
+@st.cache_data(ttl=600)
+def get_quote(ticker: str) -> dict | None:
+    try:
+        hist = yf.Ticker(ticker).history(period="6mo")
+    except Exception:
+        return None
+    if hist is None or hist.empty:
+        return None
+    close = hist["Close"].dropna()
+    last = float(close.iloc[-1])
+    prev = float(close.iloc[-2]) if len(close) > 1 else last
+    return {
+        "price": last,
+        "change": last / prev - 1.0 if prev else 0.0,
+        "history": close,
+    }
+
+
+def _direction(prob_up: float) -> str:
+    if prob_up > 0.55:
         return "LONG"
-    if prob_up < threshold - 0.05:
+    if prob_up < 0.45:
         return "SHORT"
     return "FLAT"
 
@@ -54,67 +74,110 @@ def _color(prob_up: float) -> str:
 
 
 def signal_card(title: str, signal: dict, subtitle: str = "") -> None:
-    if not signal:
-        st.info(f"{title}: no signal available")
-        return
-    prob = signal.get("prob_up", 0.5)
-    conf = signal.get("confidence", 0.0)
-    pos = signal.get("position", 0.0)
-    asof = signal.get("asof", "")
-    direction = _direction_label(prob)
-    color = _color(prob)
-
+    """Renders one signal. Uses at most a single level of st.columns, so it is
+    safe to call inside a tab or container (but not inside another column)."""
     with st.container(border=True):
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.markdown(f"### {title}")
-            if subtitle:
-                st.caption(subtitle)
-            st.markdown(
-                f"<div style='font-size:2.2rem; font-weight:700; color:{color}'>"
-                f"{direction}</div>",
-                unsafe_allow_html=True,
-            )
-            st.caption(f"as of {asof}")
-        with c2:
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Prob up", f"{prob:.1%}")
-            mc2.metric("Confidence", f"{conf:.1%}")
-            mc3.metric("Position", f"{pos:+.1%}")
-            st.progress(min(1.0, max(0.0, conf)), text="confidence")
-            if "by_horizon" in signal:
-                hcols = st.columns(len(signal["by_horizon"]))
-                for col, (h, vals) in zip(hcols, signal["by_horizon"].items()):
-                    col.metric(f"{h}d prob_up", f"{vals['prob_up']:.1%}",
-                               delta=f"std {vals['prob_std']:.2f}",
-                               delta_color="off")
+        st.markdown(f"#### {title}")
+        if subtitle:
+            st.caption(subtitle)
+        if not signal:
+            st.info("No signal available - run scripts/run_baseline.py")
+            return
+        prob = signal.get("prob_up", 0.5)
+        conf = signal.get("confidence", 0.0)
+        pos = signal.get("position", 0.0)
+        asof = signal.get("asof", "")
+        color = _color(prob)
+
+        st.markdown(
+            f"<span style='font-size:1.8rem;font-weight:700;color:{color}'>"
+            f"{_direction(prob)}</span> &nbsp;<span style='color:#888'>"
+            f"as of {asof}</span>",
+            unsafe_allow_html=True,
+        )
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Prob up", f"{prob:.1%}")
+        c2.metric("Confidence", f"{conf:.1%}")
+        c3.metric("Suggested position", f"{pos:+.1%}")
+        st.progress(min(1.0, max(0.0, conf)), text="confidence")
+
+        by_h = signal.get("by_horizon")
+        if by_h:
+            hc = st.columns(len(by_h))
+            for col, (h, vals) in zip(hc, by_h.items()):
+                col.metric(f"{h}d prob_up", f"{vals['prob_up']:.1%}",
+                           delta=f"std {vals['prob_std']:.2f}", delta_color="off")
 
 
-def equity_chart(df: pd.DataFrame) -> None:
-    if df is None or df.empty:
-        st.info("No backtest predictions yet — run `scripts/run_baseline.py`.")
+def metrics_summary(metrics: dict) -> None:
+    if not metrics or metrics.get("empty"):
+        st.info("No backtest metrics yet.")
         return
-    df = df.dropna(subset=["target_ret"]).sort_index().copy()
-    df["pnl"] = df["position"] * df["target_ret"]
-    df["bh_pnl"] = df["target_ret"]
-    df["strategy"] = (1 + df["pnl"]).cumprod()
-    df["buy_and_hold"] = (1 + df["bh_pnl"]).cumprod()
-    st.line_chart(df[["strategy", "buy_and_hold"]])
+    strat = metrics.get("strategy", {})
+    bench = metrics.get("benchmark", {})
+    c = st.columns(4)
+    c[0].metric("Sharpe", f"{strat.get('sharpe', 0):.2f}",
+                delta=f"buy&hold {bench.get('sharpe', 0):.2f}", delta_color="off")
+    c[1].metric("CAGR", f"{strat.get('cagr', 0):.1%}",
+                delta=f"buy&hold {bench.get('cagr', 0):.1%}", delta_color="off")
+    c[2].metric("Max drawdown", f"{strat.get('max_dd', 0):.1%}",
+                delta=f"buy&hold {bench.get('max_dd', 0):.1%}", delta_color="off")
+    c[3].metric("Directional hit", f"{metrics.get('hit_rate', 0):.1%}")
+    c2 = st.columns(4)
+    c2[0].metric("Log loss", f"{metrics.get('log_loss', 0):.3f}",
+                 help="below 0.693 = better than a coin flip")
+    c2[1].metric("Brier", f"{metrics.get('brier', 0):.3f}")
+    c2[2].metric("Active periods", metrics.get("n_active", 0),
+                 delta=f"of {metrics.get('n_predictions', 0)}", delta_color="off")
+    c2[3].metric("Avg turnover", f"{metrics.get('avg_turnover', 0):.3f}")
 
 
-def confidence_bucket_chart(df: pd.DataFrame) -> None:
-    if df is None or df.empty:
+def equity_chart(df: pd.DataFrame | None) -> None:
+    if df is None or df.empty or "equity" not in df.columns:
+        st.info("No backtest predictions yet.")
         return
-    df = df.dropna(subset=["target_ret"]).copy()
-    df["pnl"] = df["position"] * df["target_ret"]
-    bins = pd.cut(df["confidence"], bins=[-0.01, 0.1, 0.3, 0.6, 1.01],
-                  labels=["very_low", "low", "med", "high"])
-    agg = df.groupby(bins, observed=True).agg(
-        n=("pnl", "size"),
-        mean_pnl=("pnl", "mean"),
-        hit=("pnl", lambda x: (x > 0).mean()),
+    chart = df[["equity", "bh_equity"]].rename(
+        columns={"equity": "strategy", "bh_equity": "buy & hold"})
+    st.line_chart(chart)
+
+
+def position_chart(df: pd.DataFrame | None) -> None:
+    if df is None or df.empty or "book" not in df.columns:
+        return
+    st.caption("Model exposure over time (fraction of capital)")
+    st.area_chart(df[["book"]].rename(columns={"book": "exposure"}))
+
+
+def calibration_chart(df: pd.DataFrame | None) -> None:
+    if df is None or df.empty or "prob_up" not in df.columns:
+        return
+    d = df.dropna(subset=["prob_up", "target_ret"]).copy()
+    if d.empty:
+        return
+    d["bucket"] = (d["prob_up"] * 10).clip(0, 9).astype(int)
+    rel = d.groupby("bucket").agg(
+        predicted=("prob_up", "mean"),
+        actual=("target_ret", lambda x: (x > 0).mean()),
+        n=("prob_up", "size"),
     )
-    st.dataframe(agg.style.format({"mean_pnl": "{:.4f}", "hit": "{:.1%}"}),
+    rel = rel.set_index("predicted")[["actual"]]
+    rel["perfect"] = rel.index
+    st.caption("Calibration - 'actual' should track 'perfect' if confidence is honest")
+    st.line_chart(rel)
+
+
+def confidence_bucket_table(df: pd.DataFrame | None) -> None:
+    if df is None or df.empty or "confidence" not in df.columns:
+        return
+    d = df.dropna(subset=["target_ret"]).copy()
+    bins = pd.cut(d["confidence"], bins=[-0.01, 0.1, 0.3, 0.6, 1.01],
+                  labels=["very_low", "low", "med", "high"])
+    agg = d.groupby(bins, observed=True).agg(
+        n=("dir_correct", "size"),
+        hit_rate=("dir_correct", "mean"),
+        mean_pnl=("pnl", "mean"),
+    )
+    st.dataframe(agg.style.format({"hit_rate": "{:.1%}", "mean_pnl": "{:.5f}"}),
                  use_container_width=True)
 
 
@@ -123,74 +186,63 @@ def feature_importance_table(asset: str) -> None:
     if fi is None or fi.empty:
         st.caption("No feature importance available.")
         return
+    fi = fi.copy()
     fi["mean"] = fi.mean(axis=1)
-    top = fi.sort_values("mean", ascending=False).head(20)
-    st.dataframe(top, use_container_width=True)
+    st.bar_chart(fi.sort_values("mean", ascending=False).head(20)["mean"])
 
 
 def macro_panel() -> None:
-    px = _load_parquet(Path(__file__).resolve().parent / "data_cache" / "prices_GLD_HG=F_SLV_SPY_TIP_TLT_UUP.parquet")
+    cache_dir = ROOT / "data_cache"
     fred = None
-    cache_dir = Path(__file__).resolve().parent / "data_cache"
-    for p in cache_dir.glob("fred_*.parquet"):
+    for p in sorted(cache_dir.glob("fred_*.parquet")):
         fred = _load_parquet(p)
         break
     if fred is not None and not fred.empty:
         latest = fred.dropna().iloc[-1]
-        cols = st.columns(len(latest))
-        for col, (name, val) in zip(cols, latest.items()):
-            col.metric(name, f"{val:.2f}")
-    if px is not None and not px.empty and "GLD_close" in px.columns and "SLV_close" in px.columns:
-        gsr = px["GLD_close"] / px["SLV_close"]
-        st.caption(f"Gold/Silver ratio (latest): {gsr.iloc[-1]:.2f}")
-
-
-def metrics_summary(metrics: dict) -> None:
-    if not metrics or metrics.get("empty"):
-        st.info("No metrics yet.")
-        return
-    strat = metrics.get("strategy", {})
-    bench = metrics.get("benchmark", {})
-    cols = st.columns(4)
-    cols[0].metric("Sharpe", f"{strat.get('sharpe', 0):.2f}",
-                   delta=f"BH {bench.get('sharpe', 0):.2f}", delta_color="off")
-    cols[1].metric("Max DD", f"{strat.get('max_dd', 0):.1%}",
-                   delta=f"BH {bench.get('max_dd', 0):.1%}", delta_color="off")
-    cols[2].metric("Hit rate", f"{metrics.get('hit_rate', 0):.1%}")
-    cols[3].metric("Log loss", f"{metrics.get('log_loss', 0):.3f}",
-                   help="< 0.693 means better than random")
-    cols2 = st.columns(4)
-    cols2[0].metric("Brier", f"{metrics.get('brier', 0):.3f}")
-    cols2[1].metric("Final equity", f"{strat.get('final_equity', 1):.3f}",
-                    delta=f"BH {bench.get('final_equity', 1):.3f}", delta_color="off")
-    cols2[2].metric("# predictions", metrics.get("n_predictions", 0))
-    cols2[3].metric("# trades", metrics.get("n_trades", 0))
+        for name, val in latest.items():
+            st.metric(name, f"{val:.2f}")
+    gq, sq = get_quote("GLD"), get_quote("SLV")
+    if gq and sq and sq["price"]:
+        st.metric("Gold/Silver ratio", f"{gq['price'] / sq['price']:.2f}")
 
 
 def render_asset(asset: str) -> None:
-    st.header(f"{asset.title()} ({'GLD' if asset == 'gold' else 'SLV'})")
+    ticker = TICKERS[asset]
+    st.header(f"{asset.title()} ({ticker})")
+
+    quote = get_quote(ticker)
+    if quote:
+        q = st.columns(3)
+        q[0].metric("Current price", f"${quote['price']:.2f}",
+                    delta=f"{quote['change']:+.2%}")
+        q[1].metric("6-month high", f"${quote['history'].max():.2f}")
+        q[2].metric("6-month low", f"${quote['history'].min():.2f}")
+        st.line_chart(quote["history"].rename("close"))
 
     daily_metrics = _load_json(ART_DIR / f"metrics_daily_{asset}.json")
-    daily_signal = daily_metrics.get("latest_signal", {})
-
     st.subheader("Today's signal")
-    signal_card("Daily consensus", daily_signal,
+    signal_card("Daily consensus", daily_metrics.get("latest_signal", {}),
                 subtitle="5d / 10d / 20d ensemble")
-    cols = st.columns(2)
-    for col, lbl in zip(cols, INTRADAY_LABELS):
-        intraday_metrics = _load_json(ART_DIR / f"metrics_intraday_{asset}_{lbl}.json")
-        with col:
-            signal_card(f"Intraday {lbl}",
-                        intraday_metrics.get("latest_signal", {}),
+
+    tabs = st.tabs([f"Intraday {lbl}" for lbl in INTRADAY_LABELS])
+    for tab, lbl in zip(tabs, INTRADAY_LABELS):
+        with tab:
+            m = _load_json(ART_DIR / f"metrics_intraday_{asset}_{lbl}.json")
+            signal_card(f"Intraday {lbl}", m.get("latest_signal", {}),
                         subtitle=f"forward {lbl} model")
 
-    st.subheader("Backtest — daily 5d horizon")
+    st.subheader("Backtest - daily 5d horizon")
     metrics_summary(daily_metrics)
     bt = _load_parquet(ART_DIR / f"daily_predictions_{asset}.parquet")
     equity_chart(bt)
+    position_chart(bt)
 
-    with st.expander("PnL by confidence bucket"):
-        confidence_bucket_chart(bt)
+    with st.expander("Confidence buckets & calibration"):
+        confidence_bucket_table(bt)
+        calibration_chart(bt)
+
+    with st.expander("Feature importance (top 20)"):
+        feature_importance_table(asset)
 
     with st.expander("Intraday backtests"):
         for lbl in INTRADAY_LABELS:
@@ -199,25 +251,23 @@ def render_asset(asset: str) -> None:
             metrics_summary(m)
             bt_i = _load_parquet(ART_DIR / f"intraday_predictions_{asset}_{lbl}.parquet")
             equity_chart(bt_i)
-            confidence_bucket_chart(bt_i)
+            confidence_bucket_table(bt_i)
             st.divider()
-
-    with st.expander("Feature importance (top 20)"):
-        feature_importance_table(asset)
 
 
 def main() -> None:
     st.set_page_config(page_title="Gold/Silver Signal", layout="wide")
     st.title("Gold/Silver Signal Dashboard")
-    if not ART_DIR.exists() or not any(ART_DIR.iterdir()):
-        st.warning("No artifacts found. Run:")
+
+    if not ART_DIR.exists() or not any(ART_DIR.glob("metrics_*.json")):
+        st.warning("No artifacts found. Generate them first:")
         st.code("python scripts/run_baseline.py", language="bash")
         return
 
     with st.sidebar:
         st.markdown("### Settings")
         choice = st.radio("Asset", ["Both", "Gold", "Silver"], index=0)
-        st.caption("Re-run `python scripts/run_baseline.py` to refresh.")
+        st.caption("Re-run `python scripts/run_baseline.py` to refresh signals.")
         st.divider()
         st.markdown("### Macro regime")
         macro_panel()

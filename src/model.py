@@ -2,10 +2,60 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
 from sklearn.isotonic import IsotonicRegression
+
+
+_RESOLVED_DEVICE: str | None = None
+
+# Ensemble members use deliberately different hyper-parameters so the spread
+# of their predictions reflects genuine model uncertainty, not just RNG noise.
+_ENSEMBLE_PARAMS = [
+    dict(num_leaves=31, min_child_samples=40, colsample_bytree=0.80, learning_rate=0.030),
+    dict(num_leaves=63, min_child_samples=20, colsample_bytree=0.70, learning_rate=0.020),
+    dict(num_leaves=15, min_child_samples=80, colsample_bytree=0.90, learning_rate=0.050),
+    dict(num_leaves=47, min_child_samples=30, colsample_bytree=0.60, learning_rate=0.025),
+    dict(num_leaves=23, min_child_samples=55, colsample_bytree=0.85, learning_rate=0.035),
+]
+
+
+def resolve_device(preference: str = "auto") -> str:
+    """Pick a working LightGBM device once; fall back to CPU if GPU is absent.
+
+    Note: the stock `pip install lightgbm` wheel is CPU-only. GPU/CUDA needs a
+    GPU-enabled build. For tabular data this small, GPU rarely beats CPU.
+    """
+    global _RESOLVED_DEVICE
+    if _RESOLVED_DEVICE is not None:
+        return _RESOLVED_DEVICE
+    if preference == "cpu":
+        _RESOLVED_DEVICE = "cpu"
+        return _RESOLVED_DEVICE
+
+    candidates = []
+    if preference in ("auto", "cuda"):
+        candidates.append("cuda")
+    if preference in ("auto", "gpu"):
+        candidates.append("gpu")
+
+    rng = np.random.default_rng(0)
+    X = rng.random((256, 6))
+    y = (rng.random(256) > 0.5).astype(int)
+    for dev in candidates:
+        try:
+            lgb.LGBMClassifier(device_type=dev, n_estimators=5, verbose=-1,
+                               max_bin=255).fit(X, y)
+            _RESOLVED_DEVICE = dev
+            print(f"[device] LightGBM using device_type={dev}")
+            return dev
+        except Exception as e:
+            print(f"[device] {dev} unavailable ({str(e)[:90]}) - falling back")
+    _RESOLVED_DEVICE = "cpu"
+    print("[device] LightGBM using CPU")
+    return "cpu"
 
 
 def feature_columns(df: pd.DataFrame) -> list[str]:
@@ -13,20 +63,22 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
             if not c.startswith("target_") and c not in {"close"}]
 
 
-def _train_one(X: pd.DataFrame, y: pd.Series, seed: int) -> LGBMClassifier:
-    m = LGBMClassifier(
+def _train_one(X: pd.DataFrame, y: pd.Series, idx: int, device: str) -> LGBMClassifier:
+    params = dict(_ENSEMBLE_PARAMS[idx % len(_ENSEMBLE_PARAMS)])
+    kw = dict(
         n_estimators=400,
-        learning_rate=0.03,
-        num_leaves=31,
-        min_child_samples=40,
         subsample=0.8,
         subsample_freq=1,
-        colsample_bytree=0.8,
         reg_lambda=1.0,
-        random_state=seed,
+        random_state=42 + idx,
         n_jobs=-1,
         verbose=-1,
+        device_type=device,
     )
+    if device in ("gpu", "cuda"):
+        kw["max_bin"] = 255
+    kw.update(params)
+    m = LGBMClassifier(**kw)
     m.fit(X, y)
     return m
 
@@ -41,7 +93,7 @@ class HorizonModel:
 
 
 def _train_horizon(train_df: pd.DataFrame, target_col: str,
-                   n_models: int) -> HorizonModel | None:
+                   n_models: int, device: str) -> HorizonModel | None:
     sub = train_df.dropna(subset=[target_col]).copy()
     if len(sub) < 200:
         return None
@@ -54,12 +106,12 @@ def _train_horizon(train_df: pd.DataFrame, target_col: str,
     if y_tr.nunique() < 2 or y_cal.nunique() < 2:
         return None
 
-    models = [_train_one(X_tr, y_tr, 42 + i) for i in range(n_models)]
+    models = [_train_one(X_tr, y_tr, i, device) for i in range(n_models)]
     cal_probs = np.mean([m.predict_proba(X_cal)[:, 1] for m in models], axis=0)
     iso = IsotonicRegression(out_of_bounds="clip")
     iso.fit(cal_probs, y_cal.values)
 
-    final = [_train_one(X, y, 42 + i) for i in range(n_models)]
+    final = [_train_one(X, y, i, device) for i in range(n_models)]
     fi = np.mean([m.feature_importances_ for m in final], axis=0)
     importance = pd.Series(fi, index=cols).sort_values(ascending=False)
     return HorizonModel(horizon=None, models=final, iso=iso, cols=cols,
@@ -67,12 +119,13 @@ def _train_horizon(train_df: pd.DataFrame, target_col: str,
 
 
 def train_multi_horizon(train_df: pd.DataFrame, horizons: list,
-                        target_template: str, n_models: int = 5
-                        ) -> dict[object, HorizonModel]:
+                        target_template: str, n_models: int = 5,
+                        device: str = "auto") -> dict[object, HorizonModel]:
+    dev = resolve_device(device)
     out = {}
     for h in horizons:
         target = target_template.format(h=h)
-        hm = _train_horizon(train_df, target, n_models=n_models)
+        hm = _train_horizon(train_df, target, n_models=n_models, device=dev)
         if hm is not None:
             hm.horizon = h
             out[h] = hm
@@ -100,9 +153,11 @@ def predict_multi_horizon(models_by_h: dict, X_df: pd.DataFrame) -> pd.DataFrame
 
     consensus = df[prob_cols].mean(axis=1)
     dispersion = df[prob_cols].std(axis=1).fillna(0)
+    ens_std = df[[c for c in df.columns if c.startswith("prob_std_")]].mean(axis=1)
     df["prob_up"] = consensus
     df["dispersion"] = dispersion
     direction = (consensus - 0.5).abs() * 2.0
-    agreement = (1 - dispersion / 0.5).clip(0, 1)
-    df["confidence"] = direction * agreement
+    horizon_agree = (1 - dispersion / 0.5).clip(0, 1)
+    ens_agree = (1 - ens_std / 0.25).clip(0, 1)
+    df["confidence"] = direction * horizon_agree * ens_agree
     return df
