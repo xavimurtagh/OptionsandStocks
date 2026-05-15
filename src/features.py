@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from .config import AssetConfig, IntradayHorizon, RunConfig
+from .labeling import ewma_vol, triple_barrier, uniqueness_weights
 
 
 def _zscore(s: pd.Series, window: int) -> pd.Series:
@@ -94,11 +95,12 @@ def build_daily_features(data: dict, asset: AssetConfig,
     feats = feats.join(_ratio_features(prices))
     feats = feats.join(_cot_features(cot, asset.cftc_code, prices.index))
 
+    vol = ewma_vol(close, span=50)
     for h in cfg.daily_horizons:
-        fwd = close.shift(-h) / close - 1.0
-        feats[f"target_ret_{h}d"] = fwd
-        feats[f"target_up_{h}d"] = (fwd > 0).astype(float)
-        feats.loc[fwd.isna(), f"target_up_{h}d"] = np.nan
+        tb = triple_barrier(close, vol, horizon=h)
+        feats[f"target_ret_{h}d"] = tb["tb_ret"]
+        feats[f"target_up_{h}d"] = tb["tb_up"]
+        feats[f"weight_{h}d"] = uniqueness_weights(tb["tb_t1"])
     feats["close"] = close
     return feats[feats["close"].notna()].copy()
 
@@ -130,10 +132,11 @@ def build_intraday_features(bars: pd.DataFrame,
     out["hod_cos"] = np.cos(2 * np.pi * hod / 24.0)
     out["dow"] = bars.index.dayofweek
 
-    fwd = close.shift(-h.forward_bars) / close - 1.0
-    out["target_ret"] = fwd
-    out["target_up"] = (fwd > 0).astype(float)
-    out.loc[fwd.isna(), "target_up"] = np.nan
+    tb = triple_barrier(close, ewma_vol(close, span=50),
+                        horizon=h.forward_bars)
+    out["target_ret"] = tb["tb_ret"]
+    out["target_up"] = tb["tb_up"]
+    out["weight"] = uniqueness_weights(tb["tb_t1"])
     out["close"] = close
     return out[out["close"].notna()].copy()
 

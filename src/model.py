@@ -58,12 +58,16 @@ def resolve_device(preference: str = "auto") -> str:
     return "cpu"
 
 
+_SKIP_PREFIXES = ("target_", "weight_", "tb_t1")
+
+
 def feature_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns
-            if not c.startswith("target_") and c not in {"close"}]
+            if not c.startswith(_SKIP_PREFIXES) and c not in {"close", "weight"}]
 
 
-def _train_one(X: pd.DataFrame, y: pd.Series, idx: int, device: str) -> LGBMClassifier:
+def _train_one(X: pd.DataFrame, y: pd.Series, idx: int, device: str,
+               sample_weight=None) -> LGBMClassifier:
     params = dict(_ENSEMBLE_PARAMS[idx % len(_ENSEMBLE_PARAMS)])
     kw = dict(
         n_estimators=400,
@@ -79,7 +83,7 @@ def _train_one(X: pd.DataFrame, y: pd.Series, idx: int, device: str) -> LGBMClas
         kw["max_bin"] = 255
     kw.update(params)
     m = LGBMClassifier(**kw)
-    m.fit(X, y)
+    m.fit(X, y, sample_weight=sample_weight)
     return m
 
 
@@ -92,26 +96,31 @@ class HorizonModel:
     feature_importance: pd.Series
 
 
-def _train_horizon(train_df: pd.DataFrame, target_col: str,
-                   n_models: int, device: str) -> HorizonModel | None:
+def _train_horizon(train_df: pd.DataFrame, target_col: str, n_models: int,
+                   device: str, weight_col: str | None) -> HorizonModel | None:
     sub = train_df.dropna(subset=[target_col]).copy()
     if len(sub) < 200:
         return None
     cols = feature_columns(sub)
     X = sub[cols]
     y = sub[target_col].astype(int)
+    if weight_col and weight_col in sub.columns:
+        w = sub[weight_col].fillna(1.0).clip(lower=1e-3).to_numpy()
+    else:
+        w = np.ones(len(sub))
     cut = max(int(len(sub) * 0.8), len(sub) - 252)
     X_tr, X_cal = X.iloc[:cut], X.iloc[cut:]
     y_tr, y_cal = y.iloc[:cut], y.iloc[cut:]
+    w_tr = w[:cut]
     if y_tr.nunique() < 2 or y_cal.nunique() < 2:
         return None
 
-    models = [_train_one(X_tr, y_tr, i, device) for i in range(n_models)]
+    models = [_train_one(X_tr, y_tr, i, device, w_tr) for i in range(n_models)]
     cal_probs = np.mean([m.predict_proba(X_cal)[:, 1] for m in models], axis=0)
     iso = IsotonicRegression(out_of_bounds="clip")
     iso.fit(cal_probs, y_cal.values)
 
-    final = [_train_one(X, y, i, device) for i in range(n_models)]
+    final = [_train_one(X, y, i, device, w) for i in range(n_models)]
     fi = np.mean([m.feature_importances_ for m in final], axis=0)
     importance = pd.Series(fi, index=cols).sort_values(ascending=False)
     return HorizonModel(horizon=None, models=final, iso=iso, cols=cols,
@@ -120,12 +129,16 @@ def _train_horizon(train_df: pd.DataFrame, target_col: str,
 
 def train_multi_horizon(train_df: pd.DataFrame, horizons: list,
                         target_template: str, n_models: int = 5,
-                        device: str = "auto") -> dict[object, HorizonModel]:
+                        device: str = "auto",
+                        weight_template: str | None = None
+                        ) -> dict[object, HorizonModel]:
     dev = resolve_device(device)
     out = {}
     for h in horizons:
         target = target_template.format(h=h)
-        hm = _train_horizon(train_df, target, n_models=n_models, device=dev)
+        weight_col = weight_template.format(h=h) if weight_template else None
+        hm = _train_horizon(train_df, target, n_models=n_models, device=dev,
+                            weight_col=weight_col)
         if hm is not None:
             hm.horizon = h
             out[h] = hm
@@ -138,6 +151,23 @@ def _predict_horizon(hm: HorizonModel, X_df: pd.DataFrame) -> tuple[np.ndarray, 
     mean_raw = probs.mean(axis=0)
     cal = hm.iso.transform(mean_raw)
     return cal, probs.std(axis=0)
+
+
+def explain_primary(models_by_h: dict, X_row: pd.DataFrame,
+                    top_n: int = 8) -> list[tuple[str, float]]:
+    """Per-prediction feature contributions (LightGBM SHAP), averaged across
+    the ensemble and horizons. Returns the top_n features by absolute impact.
+    """
+    agg: dict[str, float] = {}
+    for hm in models_by_h.values():
+        X = X_row.reindex(columns=hm.cols)
+        contribs = np.mean(
+            [m.booster_.predict(X.values, pred_contrib=True)[0][:-1]
+             for m in hm.models], axis=0)
+        for col, val in zip(hm.cols, contribs):
+            agg[col] = agg.get(col, 0.0) + float(val)
+    ranked = sorted(agg.items(), key=lambda kv: abs(kv[1]), reverse=True)
+    return ranked[:top_n]
 
 
 def predict_multi_horizon(models_by_h: dict, X_df: pd.DataFrame) -> pd.DataFrame:

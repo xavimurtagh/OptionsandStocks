@@ -1,8 +1,6 @@
 """Streamlit dashboard for the gold/silver model.
 
-Run:
-    streamlit run app.py
-
+Run:  streamlit run app.py
 Reads artifacts written by scripts/run_baseline.py.
 """
 from __future__ import annotations
@@ -10,6 +8,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import altair as alt
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -50,11 +49,8 @@ def get_quote(ticker: str) -> dict | None:
     close = hist["Close"].dropna()
     last = float(close.iloc[-1])
     prev = float(close.iloc[-2]) if len(close) > 1 else last
-    return {
-        "price": last,
-        "change": last / prev - 1.0 if prev else 0.0,
-        "history": close,
-    }
+    return {"price": last, "change": last / prev - 1.0 if prev else 0.0,
+            "history": close}
 
 
 def _direction(prob_up: float) -> str:
@@ -73,40 +69,161 @@ def _color(prob_up: float) -> str:
     return "#a0aec0"
 
 
+# --- top banner -----------------------------------------------------------
+def top_signal_banner() -> None:
+    best = None
+    for asset in TICKERS:
+        for kind, path in [
+            ("daily", ART_DIR / f"metrics_daily_{asset}.json"),
+            ("1h", ART_DIR / f"metrics_intraday_{asset}_1h.json"),
+            ("15m", ART_DIR / f"metrics_intraday_{asset}_15m.json"),
+        ]:
+            sig = _load_json(path).get("latest_signal", {})
+            if not sig:
+                continue
+            conf = sig.get("confidence", 0.0)
+            if best is None or conf > best[0]:
+                best = (conf, asset, kind, sig)
+    if best is None:
+        return
+    conf, asset, kind, sig = best
+    prob = sig.get("prob_up", 0.5)
+    direction = _direction(prob)
+    color = _color(prob)
+    st.markdown(
+        f"<div style='padding:0.6rem 1rem;border-radius:8px;"
+        f"background:#1a1d23;border-left:5px solid {color}'>"
+        f"<b>Strongest signal:</b> {asset.title()} ({kind}) &nbsp; "
+        f"<span style='color:{color};font-weight:700'>{direction}</span> "
+        f"&nbsp; prob_up {prob:.0%} &nbsp; confidence {conf:.0%}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# --- signal card ----------------------------------------------------------
 def signal_card(title: str, signal: dict, subtitle: str = "") -> None:
-    """Renders one signal. Uses at most a single level of st.columns, so it is
-    safe to call inside a tab or container (but not inside another column)."""
     with st.container(border=True):
         st.markdown(f"#### {title}")
         if subtitle:
             st.caption(subtitle)
         if not signal:
-            st.info("No signal available - run scripts/run_baseline.py")
+            st.info("No signal - run scripts/run_baseline.py")
             return
         prob = signal.get("prob_up", 0.5)
         conf = signal.get("confidence", 0.0)
         pos = signal.get("position", 0.0)
-        asof = signal.get("asof", "")
-        color = _color(prob)
-
         st.markdown(
-            f"<span style='font-size:1.8rem;font-weight:700;color:{color}'>"
-            f"{_direction(prob)}</span> &nbsp;<span style='color:#888'>"
-            f"as of {asof}</span>",
+            f"<span style='font-size:1.8rem;font-weight:700;color:{_color(prob)}'>"
+            f"{_direction(prob)}</span> &nbsp;"
+            f"<span style='color:#888'>as of {signal.get('asof', '')}</span>",
             unsafe_allow_html=True,
         )
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Prob up", f"{prob:.1%}")
-        c2.metric("Confidence", f"{conf:.1%}")
-        c3.metric("Suggested position", f"{pos:+.1%}")
+        has_pos = "position" in signal
+        cols = st.columns(3 if has_pos else 2)
+        cols[0].metric("Prob up", f"{prob:.1%}")
+        cols[1].metric("Confidence", f"{conf:.1%}",
+                       help="meta-model probability the direction call is correct")
+        if has_pos:
+            cols[2].metric("Suggested position", f"{pos:+.1%}")
         st.progress(min(1.0, max(0.0, conf)), text="confidence")
-
+        if "meta_prob" in signal:
+            st.caption(f"meta P(call correct): {signal['meta_prob']:.1%}")
         by_h = signal.get("by_horizon")
         if by_h:
             hc = st.columns(len(by_h))
             for col, (h, vals) in zip(hc, by_h.items()):
-                col.metric(f"{h}d prob_up", f"{vals['prob_up']:.1%}",
+                col.metric(f"{h} prob_up", f"{vals['prob_up']:.1%}",
                            delta=f"std {vals['prob_std']:.2f}", delta_color="off")
+
+
+# --- signal explainer -----------------------------------------------------
+def explainer_panel(asset: str) -> None:
+    drivers = _load_json(ART_DIR / f"metrics_daily_{asset}.json") \
+        .get("latest_signal", {}).get("drivers", [])
+    if not drivers:
+        st.caption("No driver breakdown available.")
+        return
+    df = pd.DataFrame(drivers)
+    df["direction"] = np.where(df["contribution"] >= 0, "pushes up", "pushes down")
+    chart = alt.Chart(df).mark_bar().encode(
+        x=alt.X("contribution:Q", title="log-odds contribution"),
+        y=alt.Y("feature:N", sort="-x"),
+        color=alt.Color("direction:N",
+                        scale=alt.Scale(domain=["pushes up", "pushes down"],
+                                        range=["#1f9d55", "#c53030"])),
+        tooltip=["feature", "contribution"],
+    )
+    st.caption("What is driving today's daily signal (per-prediction SHAP)")
+    st.altair_chart(chart, use_container_width=True)
+
+
+# --- price chart with trade markers --------------------------------------
+def price_with_markers(asset: str) -> None:
+    bt = _load_parquet(ART_DIR / f"daily_predictions_{asset}.parquet")
+    if bt is None or bt.empty or "book" not in bt.columns:
+        q = get_quote(TICKERS[asset])
+        if q is not None:
+            st.line_chart(q["history"].rename("close"))
+        return
+    d = bt.reset_index()
+    date_col = d.columns[0]
+    d = d.rename(columns={date_col: "date"})
+    d["date"] = pd.to_datetime(d["date"])
+    d["dir"] = np.sign(d["book"].fillna(0))
+    d["flip"] = d["dir"].diff().fillna(0) != 0
+    flips = d[d["flip"] & (d["dir"] != 0)].copy()
+    flips["signal"] = flips["dir"].map({1.0: "go long", -1.0: "go short"})
+
+    line = alt.Chart(d).mark_line(color="#888").encode(
+        x=alt.X("date:T", title=None), y=alt.Y("close:Q", title="price"))
+    layers = [line]
+    if not flips.empty:
+        pts = alt.Chart(flips).mark_point(size=70, filled=True, opacity=0.9).encode(
+            x="date:T", y="close:Q",
+            color=alt.Color("signal:N",
+                            scale=alt.Scale(domain=["go long", "go short"],
+                                            range=["#1f9d55", "#c53030"])),
+            shape=alt.Shape("signal:N"),
+            tooltip=["date:T", "close:Q", "signal:N"])
+        layers.append(pts)
+    st.caption("Price with model entry markers (where exposure flipped)")
+    st.altair_chart(alt.layer(*layers).resolve_scale(y="shared"),
+                    use_container_width=True)
+
+
+# --- backtest with date slider -------------------------------------------
+def backtest_panel(asset: str, metrics: dict) -> None:
+    bt = _load_parquet(ART_DIR / f"daily_predictions_{asset}.parquet")
+    if bt is None or bt.empty or "equity" not in bt.columns:
+        metrics_summary(metrics)
+        st.info("No backtest predictions yet.")
+        return
+    bt = bt.sort_index()
+    dates = pd.to_datetime(bt.index)
+    lo, hi = dates.min().to_pydatetime(), dates.max().to_pydatetime()
+    if lo < hi:
+        window = st.slider(f"Backtest window ({asset})", min_value=lo,
+                           max_value=hi, value=(lo, hi), key=f"slider_{asset}")
+    else:
+        window = (lo, hi)
+    sl = bt.loc[(dates >= window[0]) & (dates <= window[1])]
+    if sl.empty:
+        st.warning("Empty window.")
+        return
+
+    pnl = sl["pnl"].fillna(0)
+    equity = (1 + pnl).cumprod()
+    bh = (1 + sl["bh_pnl"].fillna(0)).cumprod()
+    sharpe = (pnl.mean() / pnl.std(ddof=0) * np.sqrt(252)
+              if pnl.std(ddof=0) > 0 else 0.0)
+    c = st.columns(3)
+    c[0].metric("Window return", f"{equity.iloc[-1] - 1:.1%}")
+    c[1].metric("Window Sharpe", f"{sharpe:.2f}")
+    c[2].metric("Buy & hold return", f"{bh.iloc[-1] - 1:.1%}")
+    chart = pd.DataFrame({"strategy": equity, "buy & hold": bh})
+    st.line_chart(chart)
+    st.caption("Model exposure")
+    st.area_chart(sl[["book"]].rename(columns={"book": "exposure"}))
 
 
 def metrics_summary(metrics: dict) -> None:
@@ -134,36 +251,10 @@ def metrics_summary(metrics: dict) -> None:
 
 def equity_chart(df: pd.DataFrame | None) -> None:
     if df is None or df.empty or "equity" not in df.columns:
-        st.info("No backtest predictions yet.")
+        st.info("No backtest predictions.")
         return
-    chart = df[["equity", "bh_equity"]].rename(
-        columns={"equity": "strategy", "bh_equity": "buy & hold"})
-    st.line_chart(chart)
-
-
-def position_chart(df: pd.DataFrame | None) -> None:
-    if df is None or df.empty or "book" not in df.columns:
-        return
-    st.caption("Model exposure over time (fraction of capital)")
-    st.area_chart(df[["book"]].rename(columns={"book": "exposure"}))
-
-
-def calibration_chart(df: pd.DataFrame | None) -> None:
-    if df is None or df.empty or "prob_up" not in df.columns:
-        return
-    d = df.dropna(subset=["prob_up", "target_ret"]).copy()
-    if d.empty:
-        return
-    d["bucket"] = (d["prob_up"] * 10).clip(0, 9).astype(int)
-    rel = d.groupby("bucket").agg(
-        predicted=("prob_up", "mean"),
-        actual=("target_ret", lambda x: (x > 0).mean()),
-        n=("prob_up", "size"),
-    )
-    rel = rel.set_index("predicted")[["actual"]]
-    rel["perfect"] = rel.index
-    st.caption("Calibration - 'actual' should track 'perfect' if confidence is honest")
-    st.line_chart(rel)
+    st.line_chart(df[["equity", "bh_equity"]].rename(
+        columns={"equity": "strategy", "bh_equity": "buy & hold"}))
 
 
 def confidence_bucket_table(df: pd.DataFrame | None) -> None:
@@ -173,15 +264,28 @@ def confidence_bucket_table(df: pd.DataFrame | None) -> None:
     bins = pd.cut(d["confidence"], bins=[-0.01, 0.1, 0.3, 0.6, 1.01],
                   labels=["very_low", "low", "med", "high"])
     agg = d.groupby(bins, observed=True).agg(
-        n=("dir_correct", "size"),
-        hit_rate=("dir_correct", "mean"),
-        mean_pnl=("pnl", "mean"),
-    )
+        n=("dir_correct", "size"), hit_rate=("dir_correct", "mean"),
+        mean_pnl=("pnl", "mean"))
     st.dataframe(agg.style.format({"hit_rate": "{:.1%}", "mean_pnl": "{:.5f}"}),
                  use_container_width=True)
 
 
-def feature_importance_table(asset: str) -> None:
+def calibration_chart(df: pd.DataFrame | None) -> None:
+    if df is None or df.empty or "prob_up" not in df.columns:
+        return
+    d = df.dropna(subset=["prob_up", "target_ret"]).copy()
+    if d.empty:
+        return
+    d["bucket"] = (d["prob_up"] * 10).clip(0, 9).astype(int)
+    rel = d.groupby("bucket").agg(predicted=("prob_up", "mean"),
+                                  actual=("target_ret", lambda x: (x > 0).mean()))
+    rel = rel.set_index("predicted")
+    rel["perfect"] = rel.index
+    st.caption("Calibration - 'actual' should track 'perfect'")
+    st.line_chart(rel)
+
+
+def feature_importance_chart(asset: str) -> None:
     fi = _load_parquet(ART_DIR / f"feature_importance_{asset}.parquet")
     if fi is None or fi.empty:
         st.caption("No feature importance available.")
@@ -192,14 +296,12 @@ def feature_importance_table(asset: str) -> None:
 
 
 def macro_panel() -> None:
-    cache_dir = ROOT / "data_cache"
     fred = None
-    for p in sorted(cache_dir.glob("fred_*.parquet")):
+    for p in sorted((ROOT / "data_cache").glob("fred_*.parquet")):
         fred = _load_parquet(p)
         break
     if fred is not None and not fred.empty:
-        latest = fred.dropna().iloc[-1]
-        for name, val in latest.items():
+        for name, val in fred.dropna().iloc[-1].items():
             st.metric(name, f"{val:.2f}")
     gq, sq = get_quote("GLD"), get_quote("SLV")
     if gq and sq and sq["price"]:
@@ -217,41 +319,46 @@ def render_asset(asset: str) -> None:
                     delta=f"{quote['change']:+.2%}")
         q[1].metric("6-month high", f"${quote['history'].max():.2f}")
         q[2].metric("6-month low", f"${quote['history'].min():.2f}")
-        st.line_chart(quote["history"].rename("close"))
+    price_with_markers(asset)
 
     daily_metrics = _load_json(ART_DIR / f"metrics_daily_{asset}.json")
     st.subheader("Today's signal")
     signal_card("Daily consensus", daily_metrics.get("latest_signal", {}),
-                subtitle="5d / 10d / 20d ensemble")
+                subtitle="5d / 10d / 20d ensemble + meta-labelling")
+    with st.expander("Why this signal? (feature drivers)", expanded=True):
+        explainer_panel(asset)
 
     tabs = st.tabs([f"Intraday {lbl}" for lbl in INTRADAY_LABELS])
     for tab, lbl in zip(tabs, INTRADAY_LABELS):
         with tab:
             m = _load_json(ART_DIR / f"metrics_intraday_{asset}_{lbl}.json")
-            signal_card(f"Intraday {lbl}", m.get("latest_signal", {}),
+            signal_card(f"Intraday {lbl} (LightGBM)", m.get("latest_signal", {}),
                         subtitle=f"forward {lbl} model")
+            nm = _load_json(ART_DIR / f"metrics_neural_{asset}_{lbl}.json")
+            if nm.get("latest_signal"):
+                signal_card(f"Intraday {lbl} (GPU neural / TCN)",
+                            nm.get("latest_signal", {}),
+                            subtitle="Temporal Conv Net")
 
     st.subheader("Backtest - daily 5d horizon")
-    metrics_summary(daily_metrics)
-    bt = _load_parquet(ART_DIR / f"daily_predictions_{asset}.parquet")
-    equity_chart(bt)
-    position_chart(bt)
+    backtest_panel(asset, daily_metrics)
 
+    bt = _load_parquet(ART_DIR / f"daily_predictions_{asset}.parquet")
     with st.expander("Confidence buckets & calibration"):
         confidence_bucket_table(bt)
         calibration_chart(bt)
-
     with st.expander("Feature importance (top 20)"):
-        feature_importance_table(asset)
-
-    with st.expander("Intraday backtests"):
+        feature_importance_chart(asset)
+    with st.expander("Intraday & neural backtests"):
         for lbl in INTRADAY_LABELS:
-            st.markdown(f"**{lbl}**")
-            m = _load_json(ART_DIR / f"metrics_intraday_{asset}_{lbl}.json")
-            metrics_summary(m)
-            bt_i = _load_parquet(ART_DIR / f"intraday_predictions_{asset}_{lbl}.parquet")
-            equity_chart(bt_i)
-            confidence_bucket_table(bt_i)
+            st.markdown(f"**{lbl} - LightGBM**")
+            metrics_summary(_load_json(ART_DIR / f"metrics_intraday_{asset}_{lbl}.json"))
+            equity_chart(_load_parquet(
+                ART_DIR / f"intraday_predictions_{asset}_{lbl}.parquet"))
+            st.markdown(f"**{lbl} - GPU neural (TCN)**")
+            metrics_summary(_load_json(ART_DIR / f"metrics_neural_{asset}_{lbl}.json"))
+            equity_chart(_load_parquet(
+                ART_DIR / f"neural_predictions_{asset}_{lbl}.parquet"))
             st.divider()
 
 
@@ -264,10 +371,12 @@ def main() -> None:
         st.code("python scripts/run_baseline.py", language="bash")
         return
 
+    top_signal_banner()
+
     with st.sidebar:
         st.markdown("### Settings")
         choice = st.radio("Asset", ["Both", "Gold", "Silver"], index=0)
-        st.caption("Re-run `python scripts/run_baseline.py` to refresh signals.")
+        st.caption("Re-run `python scripts/run_baseline.py` to refresh.")
         st.divider()
         st.markdown("### Macro regime")
         macro_panel()
