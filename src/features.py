@@ -5,6 +5,7 @@ import pandas as pd
 
 from .config import AssetConfig, IntradayHorizon, RunConfig
 from .labeling import ewma_vol, triple_barrier, uniqueness_weights
+from .options import options_snapshot_features
 
 
 def _zscore(s: pd.Series, window: int) -> pd.Series:
@@ -41,6 +42,8 @@ def _macro_features(prices: pd.DataFrame, fred: pd.DataFrame,
     if not fred.empty:
         f = fred.reindex(prices.index).ffill()
         for col in f.columns:
+            if col == "gold_iv":  # handled as an option-market feature
+                continue
             out[f"fred_{col}_lvl"] = f[col]
             out[f"fred_{col}_chg_5d"] = f[col].diff(5)
             out[f"fred_{col}_chg_20d"] = f[col].diff(20)
@@ -73,6 +76,41 @@ def _cot_features(cot: pd.DataFrame, cftc_code: str,
     return daily
 
 
+def _options_features(close: pd.Series, fred: pd.DataFrame,
+                      snapshots: pd.DataFrame) -> pd.DataFrame:
+    """Option-market features.
+
+    Two sources, deliberately kept separate:
+      * GVZ (CBOE Gold ETF Volatility Index) - ~17 years of option-implied
+        volatility, so these participate in the historical backtest. For
+        silver it serves as a precious-metals implied-vol gauge.
+      * Accumulated live chain snapshots - richer (skew, term structure,
+        put/call flow) but forward-only, so NaN across the backtest and
+        only informative for the live signal as snapshots build up.
+    """
+    out = pd.DataFrame(index=close.index)
+    r1 = close.pct_change(fill_method=None)
+    rv = r1.rolling(20).std() * np.sqrt(252)
+
+    if fred is not None and not fred.empty and "gold_iv" in fred.columns:
+        iv = fred["gold_iv"].reindex(close.index).ffill() / 100.0
+        out["opt_iv"] = iv
+        out["opt_iv_z_252"] = _zscore(iv, 252)
+        out["opt_iv_chg_5d"] = iv.diff(5)
+        out["opt_iv_chg_20d"] = iv.diff(20)
+        out["opt_iv_pctile_252"] = iv.rolling(252).apply(
+            lambda w: float((w[-1] >= w).mean()), raw=True)
+        # Variance risk premium: implied minus trailing realized vol.
+        out["opt_vrp"] = iv - rv
+        out["opt_iv_rv_ratio"] = iv / rv.replace(0, np.nan)
+
+    if snapshots is not None and not snapshots.empty:
+        snap = snapshots.reindex(close.index).ffill(limit=5)
+        for col in snap.columns:
+            out[f"opt_{col}"] = snap[col]
+    return out
+
+
 def _ratio_features(prices: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=prices.index)
     if "GLD_close" in prices.columns and "SLV_close" in prices.columns:
@@ -94,6 +132,8 @@ def build_daily_features(data: dict, asset: AssetConfig,
     feats = feats.join(_macro_features(prices, fred, cfg))
     feats = feats.join(_ratio_features(prices))
     feats = feats.join(_cot_features(cot, asset.cftc_code, prices.index))
+    feats = feats.join(_options_features(close, fred,
+                                         options_snapshot_features(asset.ticker)))
 
     vol = ewma_vol(close, span=50)
     for h in cfg.daily_horizons:

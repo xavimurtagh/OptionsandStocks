@@ -49,8 +49,13 @@ def load_fred(series: dict[str, str], start: str, end: str | None = None,
             return df
     frames = {}
     for label, code in series.items():
-        s = pdr.DataReader(code, "fred", start, end)
-        frames[label] = s[code]
+        try:
+            s = pdr.DataReader(code, "fred", start, end)
+            frames[label] = s[code]
+        except Exception as e:
+            print(f"[fred] {label} ({code}) failed: {e}")
+    if not frames:
+        return pd.DataFrame()
     out = pd.concat(frames, axis=1).sort_index()
     out.index = pd.to_datetime(out.index).tz_localize(None)
     out = out.ffill()

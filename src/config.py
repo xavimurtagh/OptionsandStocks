@@ -59,6 +59,7 @@ class RunConfig:
         "real_yield_10y": "DFII10",
         "nominal_yield_10y": "DGS10",
         "dxy": "DTWEXBGS",
+        "gold_iv": "GVZCLS",  # CBOE Gold ETF Volatility Index (option-implied)
     })
     macro_tickers: dict = field(default_factory=lambda: {
         "tlt": "TLT", "tip": "TIP", "uup": "UUP", "spy": "SPY", "copper": "HG=F",
