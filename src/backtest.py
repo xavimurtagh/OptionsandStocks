@@ -48,8 +48,9 @@ def walk_forward_daily(df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
         if "rv_20d" in test.columns:
             out["vol"] = test["rv_20d"]
         preds.append(out)
+        meta_str = f"auc={strat.meta_auc:.3f}" if strat.meta else "off"
         print(f"[wf-daily] test {t0.date()}->{t1.date()} "
-              f"n_train={len(train)} n_test={len(test)} meta={'y' if strat.meta else 'n'}")
+              f"n_train={len(train)} n_test={len(test)} meta={meta_str}")
     return pd.concat(preds).sort_index() if preds else pd.DataFrame()
 
 

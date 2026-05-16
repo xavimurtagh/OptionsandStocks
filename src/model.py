@@ -6,7 +6,8 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
-from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
 
 
 _RESOLVED_DEVICE: str | None = None
@@ -66,11 +67,43 @@ def feature_columns(df: pd.DataFrame) -> list[str]:
             if not c.startswith(_SKIP_PREFIXES) and c not in {"close", "weight"}]
 
 
-def _train_one(X: pd.DataFrame, y: pd.Series, idx: int, device: str,
-               sample_weight=None) -> LGBMClassifier:
+def _logit(p: np.ndarray) -> np.ndarray:
+    p = np.clip(np.asarray(p, dtype=float), 1e-4, 1 - 1e-4)
+    return np.log(p / (1 - p))
+
+
+class PlattCalibrator:
+    """Sigmoid (Platt) probability calibration.
+
+    A monotonic 2-parameter logistic fit. Unlike isotonic regression it stays
+    smooth and never emits 0/1, so a single wrong call cannot blow up log loss
+    - which matters here because the calibration set is only ~250 points.
+    """
+
+    def __init__(self):
+        self.lr = LogisticRegression(C=1.0)
+        self.fitted = False
+
+    def fit(self, p_raw, y) -> "PlattCalibrator":
+        y = np.asarray(y)
+        if len(np.unique(y)) < 2:
+            return self
+        self.lr.fit(_logit(p_raw).reshape(-1, 1), y)
+        self.fitted = True
+        return self
+
+    def transform(self, p_raw) -> np.ndarray:
+        if not self.fitted:
+            return np.clip(np.asarray(p_raw, dtype=float), 1e-3, 1 - 1e-3)
+        return self.lr.predict_proba(_logit(p_raw).reshape(-1, 1))[:, 1]
+
+
+def _train_one(X: pd.DataFrame, y, idx: int, device: str,
+               sample_weight=None, n_estimators: int = 400,
+               eval_set=None) -> LGBMClassifier:
     params = dict(_ENSEMBLE_PARAMS[idx % len(_ENSEMBLE_PARAMS)])
     kw = dict(
-        n_estimators=400,
+        n_estimators=n_estimators,
         subsample=0.8,
         subsample_freq=1,
         reg_lambda=1.0,
@@ -83,7 +116,11 @@ def _train_one(X: pd.DataFrame, y: pd.Series, idx: int, device: str,
         kw["max_bin"] = 255
     kw.update(params)
     m = LGBMClassifier(**kw)
-    m.fit(X, y, sample_weight=sample_weight)
+    if eval_set is not None:
+        m.fit(X, y, sample_weight=sample_weight, eval_set=[eval_set],
+              callbacks=[lgb.early_stopping(40, verbose=False)])
+    else:
+        m.fit(X, y, sample_weight=sample_weight)
     return m
 
 
@@ -91,7 +128,7 @@ def _train_one(X: pd.DataFrame, y: pd.Series, idx: int, device: str,
 class HorizonModel:
     horizon: object
     models: list
-    iso: IsotonicRegression
+    calib: PlattCalibrator
     cols: list[str]
     feature_importance: pd.Series
 
@@ -115,15 +152,20 @@ def _train_horizon(train_df: pd.DataFrame, target_col: str, n_models: int,
     if y_tr.nunique() < 2 or y_cal.nunique() < 2:
         return None
 
-    models = [_train_one(X_tr, y_tr, i, device, w_tr) for i in range(n_models)]
-    cal_probs = np.mean([m.predict_proba(X_cal)[:, 1] for m in models], axis=0)
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(cal_probs, y_cal.values)
+    # Stage 1: early-stopped models on the train split decide the tree count
+    # and supply out-of-sample probabilities for calibration.
+    staged = [_train_one(X_tr, y_tr, i, device, w_tr,
+                         eval_set=(X_cal, y_cal)) for i in range(n_models)]
+    cal_probs = np.mean([m.predict_proba(X_cal)[:, 1] for m in staged], axis=0)
+    calib = PlattCalibrator().fit(cal_probs, y_cal.values)
+    best_iters = [int(m.best_iteration_ or 400) for m in staged]
 
-    final = [_train_one(X, y, i, device, w) for i in range(n_models)]
+    # Stage 2: final models on the full window, tree count fixed by stage 1.
+    final = [_train_one(X, y, i, device, w, n_estimators=best_iters[i])
+             for i in range(n_models)]
     fi = np.mean([m.feature_importances_ for m in final], axis=0)
     importance = pd.Series(fi, index=cols).sort_values(ascending=False)
-    return HorizonModel(horizon=None, models=final, iso=iso, cols=cols,
+    return HorizonModel(horizon=None, models=final, calib=calib, cols=cols,
                         feature_importance=importance)
 
 
@@ -148,8 +190,7 @@ def train_multi_horizon(train_df: pd.DataFrame, horizons: list,
 def _predict_horizon(hm: HorizonModel, X_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     X = X_df.reindex(columns=hm.cols)
     probs = np.stack([m.predict_proba(X)[:, 1] for m in hm.models], axis=0)
-    mean_raw = probs.mean(axis=0)
-    cal = hm.iso.transform(mean_raw)
+    cal = hm.calib.transform(probs.mean(axis=0))
     return cal, probs.std(axis=0)
 
 
