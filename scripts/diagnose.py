@@ -1,7 +1,8 @@
-"""Skill diagnostics for an already-run backtest.
+"""Skill diagnostics for the volatility-targeted trend backtest.
 
-Reads the prediction parquets in artifacts/ and reports whether each model
-genuinely beats chance - no re-training, runs in seconds.
+Reads the daily prediction parquets in artifacts/ and reports whether the
+volatility forecast has genuine skill and whether the strategy earns a real,
+cost-robust, risk-adjusted edge. No re-training - runs in seconds.
 
 Usage:
     python scripts/diagnose.py
@@ -13,94 +14,96 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 
 ROOT = Path(__file__).resolve().parent.parent
 ART_DIR = ROOT / "artifacts"
-COIN_FLIP_LOG_LOSS = 0.6931
+PPY = 252  # trading periods per year
 
 
-def _verdict(auc: float, ll: float, monotonic: bool) -> str:
-    if auc >= 0.55 and ll < COIN_FLIP_LOG_LOSS and monotonic:
-        return "EDGE - worth forward paper-trading"
-    if auc >= 0.52 and ll < COIN_FLIP_LOG_LOSS:
-        return "MARGINAL - weak signal, not yet tradeable"
-    return "NO EDGE - do not trade; calibration/confidence not trustworthy"
+def _sharpe(rets: pd.Series) -> float:
+    r = rets.dropna()
+    sd = r.std(ddof=0)
+    return float(r.mean() / sd * np.sqrt(PPY)) if sd > 0 else 0.0
 
 
-def diagnose(label: str, path: Path) -> None:
+def _max_dd(rets: pd.Series) -> float:
+    eq = (1 + rets.fillna(0)).cumprod()
+    return float((eq / eq.cummax() - 1).min())
+
+
+def _r2(pred: pd.Series, actual: pd.Series) -> float:
+    ss_res = float(((pred - actual) ** 2).sum())
+    ss_tot = float(((actual - actual.mean()) ** 2).sum())
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+
+def _verdict(vol_r2: float, naive_r2: float, sharpe: float, sharpe_2x: float,
+             vt_sharpe: float, dd: float, bh_dd: float) -> str:
+    beats_naive = vol_r2 > naive_r2 or np.isnan(naive_r2)
+    if (beats_naive and vol_r2 >= 0.30 and sharpe >= 0.8
+            and sharpe >= vt_sharpe and sharpe_2x > 0.5 and dd > bh_dd):
+        return "REAL EDGE - vol forecast is skilful and the strategy is robust"
+    if beats_naive and vol_r2 >= 0.15 and sharpe >= 0.4:
+        return "MARGINAL - some skill, not yet convincing"
+    return "NO EDGE - vol forecast or strategy does not clear the bar"
+
+
+def diagnose(label: str, path: Path) -> bool:
     if not path.exists():
-        return
-    df = pd.read_parquet(path)
-    need = {"prob_up", "target_ret"}
-    if not need.issubset(df.columns):
-        print(f"\n## {label}: missing columns, skipped")
-        return
-    d = df.dropna(subset=["prob_up", "target_ret"]).copy()
-    if len(d) < 50:
-        print(f"\n## {label}: only {len(d)} rows, too few to judge")
-        return
+        return False
+    df = pd.read_parquet(path).sort_index()
+    if not {"vol_fcst", "realized_rv", "pnl", "bh_pnl"}.issubset(df.columns):
+        print(f"\n## {label}: missing expected columns, skipped")
+        return True
+    print(f"\n## {label}   ({len(df)} predictions)")
 
-    up = (d["target_ret"] > 0).astype(int)
-    base = up.mean()
-    p = d["prob_up"].clip(1e-4, 1 - 1e-4)
+    # --- volatility-forecast skill -----------------------------------------
+    v = df[["vol_fcst", "realized_rv"]].dropna()
+    if len(v) < 30:
+        print("  too few scored rows to judge vol skill")
+        return True
+    vol_r2 = _r2(v["vol_fcst"], v["realized_rv"])
+    vol_corr = float(v["vol_fcst"].corr(v["realized_rv"]))
+    naive_r2 = float("nan")
+    if "rv_20d" in df.columns:
+        nv = df[["rv_20d", "realized_rv"]].dropna()
+        if len(nv) > 30:
+            naive_r2 = _r2(nv["rv_20d"], nv["realized_rv"])
+    print(f"  vol forecast R^2       : {vol_r2:+.3f}   "
+          f"(naive rv_20d baseline {naive_r2:+.3f})")
+    print(f"  vol forecast corr      : {vol_corr:+.3f}   (1.0 = perfect)")
 
-    auc = roc_auc_score(up, p) if up.nunique() > 1 else float("nan")
-    ll = log_loss(up, p)
-    brier = brier_score_loss(up, p)
-    model_hit = ((np.sign(d["prob_up"] - 0.5)) == np.sign(d["target_ret"])).mean()
-    always_long_hit = base
+    # --- strategy vs benchmarks --------------------------------------------
+    sharpe = _sharpe(df["pnl"])
+    bh_sharpe = _sharpe(df["bh_pnl"])
+    vt_sharpe = _sharpe(df["vt_bh_pnl"]) if "vt_bh_pnl" in df.columns else 0.0
+    dd, bh_dd = _max_dd(df["pnl"]), _max_dd(df["bh_pnl"])
+    strat_ret = (1 + df["pnl"].fillna(0)).prod() - 1
+    bh_ret = (1 + df["bh_pnl"].fillna(0)).prod() - 1
+    print(f"  strategy Sharpe        : {sharpe:+.2f}   "
+          f"(buy&hold {bh_sharpe:+.2f}, vol-targeted b&h {vt_sharpe:+.2f})")
+    print(f"  max drawdown           : {dd:.1%}   (buy&hold {bh_dd:.1%})")
+    print(f"  total return  strategy {strat_ret:+.1%}   buy&hold {bh_ret:+.1%}")
 
-    print(f"\n## {label}   ({len(d)} predictions)")
-    print(f"  base rate P(up)        : {base:.3f}")
-    print(f"  AUC (prob_up vs up)    : {auc:.3f}   (0.50 = no skill)")
-    print(f"  log loss               : {ll:.3f}   (coin flip = {COIN_FLIP_LOG_LOSS})")
-    print(f"  Brier                  : {brier:.3f}")
-    print(f"  model hit rate         : {model_hit:.3f}")
-    print(f"  always-long hit rate   : {always_long_hit:.3f}   "
-          f"<- the benchmark to beat")
+    # --- cost sensitivity ---------------------------------------------------
+    sharpe_2x = sharpe
+    if {"cost"}.issubset(df.columns):
+        gross = df["pnl"] + df["cost"]
+        line = []
+        for k in (1, 2, 4):
+            s = _sharpe(gross - k * df["cost"])
+            line.append(f"{k}x={s:+.2f}")
+            if k == 2:
+                sharpe_2x = s
+        print(f"  Sharpe vs cost         : {'  '.join(line)}")
+    if "turnover" in df.columns:
+        print(f"  avg turnover           : {df['turnover'].mean():.3f}")
+    if "dir_correct" in df.columns:
+        print(f"  trend hit rate         : {df['dir_correct'].mean():.3f}  "
+              f"(secondary - expectancy matters more than hit rate)")
 
-    # Calibration: are predicted probabilities honest?
-    print("  calibration (predicted -> actual):")
-    try:
-        d["pbin"] = pd.qcut(p, 5, duplicates="drop")
-        g = d.groupby("pbin", observed=True)
-        cal = pd.DataFrame({
-            "pred": g["prob_up"].mean(),
-            "actual": g["target_ret"].apply(lambda s: (s > 0).mean()),
-            "n": g.size(),
-        })
-        for _, r in cal.iterrows():
-            print(f"    pred {r['pred']:.2f} -> actual {r['actual']:.2f}  "
-                  f"(n={int(r['n'])}, gap {r['actual'] - r['pred']:+.2f})")
-    except ValueError:
-        print("    (not enough spread in probabilities)")
-
-    # Confidence monotonicity: should hit rate rise with confidence?
-    monotonic = True
-    if "confidence" in d.columns:
-        d["cbin"] = pd.cut(d["confidence"], [-0.01, 0.1, 0.3, 0.6, 1.01],
-                           labels=["very_low", "low", "med", "high"])
-        hits = (np.sign(d["prob_up"] - 0.5) == np.sign(d["target_ret"]))
-        conf = d.assign(hit=hits).groupby("cbin", observed=True)["hit"].agg(
-            ["mean", "size"])
-        print("  hit rate by confidence bucket:")
-        vals = []
-        for idx, r in conf.iterrows():
-            print(f"    {idx:<9}: {r['mean']:.3f}  (n={int(r['size'])})")
-            vals.append(r["mean"])
-        monotonic = all(x <= y + 0.02 for x, y in zip(vals, vals[1:])) \
-            if len(vals) > 1 else True
-        if not monotonic:
-            print("    !! confidence does NOT track accuracy - sizing is unsafe")
-
-    if {"pnl", "bh_pnl"}.issubset(d.columns):
-        strat_ret = (1 + d["pnl"].fillna(0)).prod() - 1
-        bh_ret = (1 + d["bh_pnl"].fillna(0)).prod() - 1
-        print(f"  total return  strategy {strat_ret:+.2%}   "
-              f"buy&hold {bh_ret:+.2%}")
-
-    print(f"  VERDICT: {_verdict(auc, ll, monotonic)}")
+    print(f"  VERDICT: {_verdict(vol_r2, naive_r2, sharpe, sharpe_2x, vt_sharpe, dd, bh_dd)}")
+    return True
 
 
 def main() -> None:
@@ -108,24 +111,21 @@ def main() -> None:
         print("No artifacts/ directory - run scripts/run_baseline.py first")
         sys.exit(1)
     print("=" * 64)
-    print("BACKTEST SKILL DIAGNOSTICS")
+    print("VOLATILITY-TARGETED TREND - BACKTEST DIAGNOSTICS")
     print("=" * 64)
     found = False
     for asset in ("gold", "silver"):
-        diagnose(f"{asset} daily",
-                 ART_DIR / f"daily_predictions_{asset}.parquet")
-        for lbl in ("1h", "15m"):
-            diagnose(f"{asset} intraday {lbl} (LightGBM)",
-                     ART_DIR / f"intraday_predictions_{asset}_{lbl}.parquet")
-            diagnose(f"{asset} intraday {lbl} (neural TCN)",
-                     ART_DIR / f"neural_predictions_{asset}_{lbl}.parquet")
-        found = True
-    if found:
-        print("\n" + "=" * 64)
-        print("Reminder: AUC ~0.50 means the features carry no directional")
-        print("signal at that horizon. Calibration/meta fixes make the model")
-        print("HONEST, not profitable - profit needs a real AUC > ~0.53.")
-        print("=" * 64)
+        if diagnose(f"{asset} daily",
+                    ART_DIR / f"daily_predictions_{asset}.parquet"):
+            found = True
+    if not found:
+        print("\nNo daily prediction files - run scripts/run_baseline.py first")
+        return
+    print("\n" + "=" * 64)
+    print("A skilful vol forecast must beat the naive rv_20d baseline. The")
+    print("strategy's edge is risk-adjusted return and drawdown control after")
+    print("costs - not necessarily beating a long-only bull market on Sharpe.")
+    print("=" * 64)
 
 
 if __name__ == "__main__":

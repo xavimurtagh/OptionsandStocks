@@ -121,6 +121,36 @@ def _ratio_features(prices: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def vol_targets(close: pd.Series, horizons: list[int]) -> pd.DataFrame:
+    """Forward realized volatility - the prediction target.
+
+    `fwd_rv_{h}d` at row t is the annualized std of daily returns over the h
+    days strictly after t (no look-ahead - trailing rows become NaN).
+    `fwd_ret_{h}d` is the realized h-day forward return, kept for diagnostics
+    only and never used as a training label.
+    """
+    r1 = close.pct_change(fill_method=None)
+    out = pd.DataFrame(index=close.index)
+    for h in horizons:
+        out[f"fwd_rv_{h}d"] = r1.rolling(h).std().shift(-h) * np.sqrt(252)
+        out[f"fwd_ret_{h}d"] = close.pct_change(h, fill_method=None).shift(-h)
+    return out
+
+
+def trend_signal(close: pd.Series, rv_60d: pd.Series) -> pd.Series:
+    """Vol-normalized multi-horizon time-series momentum, smoothed to [-1, 1].
+
+    Sign gives direction, magnitude gives conviction. Deterministic - no fit.
+    """
+    lookbacks = (21, 63, 126, 252)
+    acc = pd.Series(0.0, index=close.index)
+    for L in lookbacks:
+        mom = close.pct_change(L, fill_method=None)
+        norm = (rv_60d * np.sqrt(L / 252.0)).replace(0, np.nan)
+        acc = acc + np.tanh((mom / norm) / 1.5)
+    return acc / len(lookbacks)
+
+
 def build_daily_features(data: dict, asset: AssetConfig,
                          cfg: RunConfig) -> pd.DataFrame:
     prices = data["prices"]
@@ -135,12 +165,8 @@ def build_daily_features(data: dict, asset: AssetConfig,
     feats = feats.join(_options_features(close, fred,
                                          options_snapshot_features(asset.ticker)))
 
-    vol = ewma_vol(close, span=50)
-    for h in cfg.daily_horizons:
-        tb = triple_barrier(close, vol, horizon=h)
-        feats[f"target_ret_{h}d"] = tb["tb_ret"]
-        feats[f"target_up_{h}d"] = tb["tb_up"]
-        feats[f"weight_{h}d"] = uniqueness_weights(tb["tb_t1"])
+    feats["trend_signal"] = trend_signal(close, feats["rv_60d"])
+    feats = feats.join(vol_targets(close, cfg.daily_horizons))
     feats["close"] = close
     return feats[feats["close"].notna()].copy()
 

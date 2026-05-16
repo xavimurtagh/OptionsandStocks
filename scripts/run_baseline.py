@@ -1,13 +1,15 @@
 """End-to-end gold/silver pipeline.
 
-Daily multi-horizon + intraday, triple-barrier labels, meta-labelling
-confidence, volatility-targeted sizing, and an optional GPU neural model.
+Daily volatility-targeted trend-following model: a multi-horizon LightGBM
+ensemble forecasts forward realized volatility, which sizes a time-series
+momentum position. The retired direction classifier / meta-labelling / TCN
+remain on disk but are opt-in only.
 
 Usage:
-    python scripts/run_baseline.py              # both assets, everything
+    python scripts/run_baseline.py              # both assets, daily model
     python scripts/run_baseline.py gold
-    python scripts/run_baseline.py --no-intraday
-    python scripts/run_baseline.py --no-neural
+    python scripts/run_baseline.py --intraday   # also run retired intraday
+    python scripts/run_baseline.py --intraday --neural
 
 Outputs land in artifacts/ for the Streamlit UI.
 """
@@ -22,13 +24,14 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.backtest import (evaluate, kelly_size, walk_forward_daily,
-                          walk_forward_intraday)
+from src.backtest import (evaluate, kelly_size, walk_forward_intraday,
+                          walk_forward_vol_daily)
 from src.config import ART_DIR, ASSETS, RunConfig
 from src.data import load_all, load_intraday
 from src.features import build_daily_features, build_intraday_features
 from src.meta import MetaStrategy
-from src.model import explain_primary
+from src.model import (explain_primary, predict_vol_multi_horizon,
+                       train_vol_multi_horizon)
 from src.neural import HAS_TORCH, neural_latest, neural_predictions
 
 
@@ -77,6 +80,33 @@ def _signal_from_pred(pred_row: pd.Series, cfg: RunConfig,
     return sig
 
 
+def _vol_signal(feat_row: pd.Series, fc_row: pd.Series, cfg: RunConfig) -> dict:
+    trend = float(feat_row["trend_signal"])
+    vol_fcst = float(fc_row["vol_fcst"])
+    ratio = min(max(cfg.target_vol / vol_fcst, 0.0), cfg.max_leverage)
+    pos = trend * ratio
+    if (cfg.vrp_filter and "opt_iv" in feat_row.index
+            and pd.notna(feat_row["opt_iv"])
+            and feat_row["opt_iv"] / vol_fcst > 1.5):
+        pos *= 0.5
+    direction = "LONG" if trend > 0.05 else "SHORT" if trend < -0.05 else "FLAT"
+    return {
+        "asof": str(feat_row.name),
+        "trend_signal": trend,
+        "trend_direction": direction,
+        "vol_forecast": vol_fcst,
+        "realized_vol_20d": float(feat_row.get("rv_20d", float("nan"))),
+        "target_position": pos,
+        "by_horizon": {
+            str(h): {
+                "vol_fcst": float(fc_row[f"vol_fcst_{h}"]),
+                "vol_fcst_std": float(fc_row[f"vol_fcst_std_{h}"]),
+            }
+            for h in cfg.daily_horizons if f"vol_fcst_{h}" in fc_row.index
+        },
+    }
+
+
 def run_daily(name: str, data: dict, cfg: RunConfig) -> dict:
     asset = ASSETS[name]
     print(f"\n=== DAILY {name.upper()} ({asset.ticker}) ===")
@@ -84,33 +114,35 @@ def run_daily(name: str, data: dict, cfg: RunConfig) -> dict:
     print(f"feature matrix: {feats.shape}, "
           f"span {feats.index.min().date()} -> {feats.index.max().date()}")
 
-    bt = walk_forward_daily(feats, cfg)
+    bt = walk_forward_vol_daily(feats, cfg)
     summary = {"empty": True}
     if not bt.empty:
         summary, enriched = evaluate(bt, cfg, holding=cfg.backtest_horizon,
                                      periods_per_year=252)
         enriched.to_parquet(ART_DIR / f"daily_predictions_{name}.parquet")
-        print("-- strategy --", summary["strategy"])
-        print("-- benchmark --", summary["benchmark"])
-        print(f"hit={summary['hit_rate']:.3f} log_loss={summary['log_loss']:.3f} "
-              f"n_active={summary['n_active']}")
-        print(summary["by_confidence"])
+        print("-- strategy     --", summary["strategy"])
+        print("-- buy & hold   --", summary["benchmark"])
+        if "vt_benchmark" in summary:
+            print("-- vol-tgt b&h  --", summary["vt_benchmark"])
+        print(f"vol_r2={summary.get('vol_r2', float('nan')):.3f} "
+              f"vol_corr={summary.get('vol_corr', float('nan')):.3f} "
+              f"trend_hit={summary.get('hit_rate', 0):.3f}")
 
-    ret_col = f"target_ret_{cfg.backtest_horizon}d"
-    strat = MetaStrategy(cfg.daily_horizons, "target_up_{h}d", ret_col,
-                         "weight_{h}d", n_ensemble=cfg.n_ensemble,
-                         device=cfg.device).fit(feats.dropna(subset=[ret_col]))
+    rv_col = f"fwd_rv_{cfg.backtest_horizon}d"
+    models = train_vol_multi_horizon(feats.dropna(subset=[rv_col]),
+                                     cfg.daily_horizons, n_models=cfg.n_ensemble,
+                                     device=cfg.device)
     latest_signal = {}
-    if strat.ok:
+    if models:
         latest_row = feats.iloc[[-1]]
-        pred = strat.predict(latest_row).iloc[0]
-        latest_signal = _signal_from_pred(pred, cfg, horizons=list(strat.primary))
+        fc_row = predict_vol_multi_horizon(models, latest_row).iloc[0]
+        latest_signal = _vol_signal(feats.iloc[-1], fc_row, cfg)
         latest_signal["drivers"] = [
             {"feature": f, "contribution": c}
-            for f, c in explain_primary(strat.primary, latest_row)
+            for f, c in explain_primary(models, latest_row)
         ]
         fi = pd.concat({h: hm.feature_importance
-                        for h, hm in strat.primary.items()}, axis=1)
+                        for h, hm in models.items()}, axis=1)
         fi.to_parquet(ART_DIR / f"feature_importance_{name}.parquet")
 
     _save_metrics(f"daily_{name}", {**summary, "latest_signal": latest_signal})
@@ -170,9 +202,11 @@ def run_intraday(name: str, cfg: RunConfig, do_neural: bool) -> dict:
 
 
 def main(argv: list[str]) -> None:
+    # Daily vol-targeted trend model is the pipeline. Intraday and the neural
+    # TCN are retired direction models - opt in explicitly to run them.
     do_daily = "--no-daily" not in argv
-    do_intraday = "--no-intraday" not in argv
-    do_neural = "--no-neural" not in argv
+    do_intraday = "--intraday" in argv
+    do_neural = "--neural" in argv
     targets = [a for a in argv[1:] if not a.startswith("--")] or list(ASSETS)
     cfg = RunConfig()
 

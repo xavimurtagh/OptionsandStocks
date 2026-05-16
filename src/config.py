@@ -55,6 +55,9 @@ class RunConfig:
     daily_horizons: list = field(default_factory=lambda: [5, 10, 20])
     intraday_horizons: list = field(default_factory=lambda: list(INTRADAY_HORIZONS))
     backtest_horizon: int = 5  # which daily horizon to use for backtest PnL
+    target_vol: float = 0.12   # annualized volatility target for sizing
+    max_leverage: float = 2.0  # cap on absolute position size
+    vrp_filter: bool = False   # cut exposure when implied vol >> forecast vol
     fred_series: dict = field(default_factory=lambda: {
         "real_yield_10y": "DFII10",
         "nominal_yield_10y": "DGS10",

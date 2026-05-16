@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMClassifier, LGBMRegressor
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
@@ -59,12 +59,13 @@ def resolve_device(preference: str = "auto") -> str:
     return "cpu"
 
 
-_SKIP_PREFIXES = ("target_", "weight_", "tb_t1")
+_SKIP_PREFIXES = ("target_", "weight_", "tb_t1", "fwd_rv_", "fwd_ret_")
 
 
 def feature_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns
-            if not c.startswith(_SKIP_PREFIXES) and c not in {"close", "weight"}]
+            if not c.startswith(_SKIP_PREFIXES)
+            and c not in {"close", "weight", "trend_signal"}]
 
 
 def _logit(p: np.ndarray) -> np.ndarray:
@@ -231,4 +232,102 @@ def predict_multi_horizon(models_by_h: dict, X_df: pd.DataFrame) -> pd.DataFrame
     horizon_agree = (1 - dispersion / 0.5).clip(0, 1)
     ens_agree = (1 - ens_std / 0.25).clip(0, 1)
     df["confidence"] = direction * horizon_agree * ens_agree
+    return df
+
+
+# --- volatility regression -------------------------------------------------
+# Parallel track to the classifier above. Forecasts forward realized vol -
+# a genuinely predictable target - which drives volatility-targeted sizing.
+
+
+def _train_one_reg(X: pd.DataFrame, y, idx: int, device: str,
+                   n_estimators: int = 400, eval_set=None) -> LGBMRegressor:
+    params = dict(_ENSEMBLE_PARAMS[idx % len(_ENSEMBLE_PARAMS)])
+    kw = dict(
+        n_estimators=n_estimators,
+        subsample=0.8,
+        subsample_freq=1,
+        reg_lambda=1.0,
+        random_state=42 + idx,
+        n_jobs=-1,
+        verbose=-1,
+        device_type=device,
+        objective="regression",
+        metric="l2",
+    )
+    if device in ("gpu", "cuda"):
+        kw["max_bin"] = 255
+    kw.update(params)
+    m = LGBMRegressor(**kw)
+    if eval_set is not None:
+        m.fit(X, y, eval_set=[eval_set],
+              callbacks=[lgb.early_stopping(40, verbose=False)])
+    else:
+        m.fit(X, y)
+    return m
+
+
+@dataclass
+class VolHorizonModel:
+    horizon: object
+    models: list
+    cols: list[str]
+    feature_importance: pd.Series
+
+
+def _train_vol_horizon(train_df: pd.DataFrame, target_col: str, n_models: int,
+                       device: str) -> VolHorizonModel | None:
+    sub = train_df.dropna(subset=[target_col]).copy()
+    if len(sub) < 200:
+        return None
+    cols = feature_columns(sub)
+    X = sub[cols]
+    y = sub[target_col].astype(float)
+    cut = max(int(len(sub) * 0.8), len(sub) - 252)
+    X_tr, X_ev = X.iloc[:cut], X.iloc[cut:]
+    y_tr, y_ev = y.iloc[:cut], y.iloc[cut:]
+    if len(X_ev) < 20:
+        return None
+
+    # Stage 1: early stopping fixes the tree count on a held-out tail.
+    staged = [_train_one_reg(X_tr, y_tr, i, device, eval_set=(X_ev, y_ev))
+              for i in range(n_models)]
+    best_iters = [int(m.best_iteration_ or 400) for m in staged]
+    # Stage 2: refit on the full window with that tree count.
+    final = [_train_one_reg(X, y, i, device, n_estimators=best_iters[i])
+             for i in range(n_models)]
+    fi = np.mean([m.feature_importances_ for m in final], axis=0)
+    importance = pd.Series(fi, index=cols).sort_values(ascending=False)
+    return VolHorizonModel(horizon=None, models=final, cols=cols,
+                           feature_importance=importance)
+
+
+def train_vol_multi_horizon(train_df: pd.DataFrame, horizons: list,
+                            target_template: str = "fwd_rv_{h}d",
+                            n_models: int = 5, device: str = "auto"
+                            ) -> dict[object, VolHorizonModel]:
+    dev = resolve_device(device)
+    out = {}
+    for h in horizons:
+        target = target_template.format(h=h)
+        if target not in train_df.columns:
+            continue
+        hm = _train_vol_horizon(train_df, target, n_models=n_models, device=dev)
+        if hm is not None:
+            hm.horizon = h
+            out[h] = hm
+    return out
+
+
+def predict_vol_multi_horizon(models_by_h: dict, X_df: pd.DataFrame) -> pd.DataFrame:
+    df = pd.DataFrame(index=X_df.index)
+    fcst_cols = []
+    for h, hm in models_by_h.items():
+        X = X_df.reindex(columns=hm.cols)
+        preds = np.stack([m.predict(X) for m in hm.models], axis=0)
+        df[f"vol_fcst_{h}"] = np.clip(preds.mean(axis=0), 0.01, None)
+        df[f"vol_fcst_std_{h}"] = preds.std(axis=0)
+        fcst_cols.append(f"vol_fcst_{h}")
+    if fcst_cols:
+        df["vol_fcst"] = df[fcst_cols].mean(axis=1)
     return df

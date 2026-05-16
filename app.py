@@ -1,4 +1,4 @@
-"""Streamlit dashboard for the gold/silver model.
+"""Streamlit dashboard for the gold/silver volatility-targeted trend model.
 
 Run:  streamlit run app.py
 Reads artifacts written by scripts/run_baseline.py.
@@ -17,7 +17,6 @@ import yfinance as yf
 ROOT = Path(__file__).resolve().parent
 ART_DIR = ROOT / "artifacts"
 TICKERS = {"gold": "GLD", "silver": "SLV"}
-INTRADAY_LABELS = ["1h", "15m"]
 
 
 def _load_json(path: Path) -> dict:
@@ -53,18 +52,18 @@ def get_quote(ticker: str) -> dict | None:
             "history": close}
 
 
-def _direction(prob_up: float) -> str:
-    if prob_up > 0.55:
+def _trend_direction(trend: float) -> str:
+    if trend > 0.05:
         return "LONG"
-    if prob_up < 0.45:
+    if trend < -0.05:
         return "SHORT"
     return "FLAT"
 
 
-def _color(prob_up: float) -> str:
-    if prob_up > 0.55:
+def _color(trend: float) -> str:
+    if trend > 0.05:
         return "#1f9d55"
-    if prob_up < 0.45:
+    if trend < -0.05:
         return "#c53030"
     return "#a0aec0"
 
@@ -73,29 +72,26 @@ def _color(prob_up: float) -> str:
 def top_signal_banner() -> None:
     best = None
     for asset in TICKERS:
-        for kind, path in [
-            ("daily", ART_DIR / f"metrics_daily_{asset}.json"),
-            ("1h", ART_DIR / f"metrics_intraday_{asset}_1h.json"),
-            ("15m", ART_DIR / f"metrics_intraday_{asset}_15m.json"),
-        ]:
-            sig = _load_json(path).get("latest_signal", {})
-            if not sig:
-                continue
-            conf = sig.get("confidence", 0.0)
-            if best is None or conf > best[0]:
-                best = (conf, asset, kind, sig)
+        sig = _load_json(ART_DIR / f"metrics_daily_{asset}.json") \
+            .get("latest_signal", {})
+        if not sig:
+            continue
+        score = abs(sig.get("target_position", 0.0))
+        if best is None or score > best[0]:
+            best = (score, asset, sig)
     if best is None:
         return
-    conf, asset, kind, sig = best
-    prob = sig.get("prob_up", 0.5)
-    direction = _direction(prob)
-    color = _color(prob)
+    _, asset, sig = best
+    trend = sig.get("trend_signal", 0.0)
+    color = _color(trend)
     st.markdown(
         f"<div style='padding:0.6rem 1rem;border-radius:8px;"
         f"background:#1a1d23;border-left:5px solid {color}'>"
-        f"<b>Strongest signal:</b> {asset.title()} ({kind}) &nbsp; "
-        f"<span style='color:{color};font-weight:700'>{direction}</span> "
-        f"&nbsp; prob_up {prob:.0%} &nbsp; confidence {conf:.0%}</div>",
+        f"<b>Strongest signal:</b> {asset.title()} &nbsp; "
+        f"<span style='color:{color};font-weight:700'>"
+        f"{_trend_direction(trend)}</span> &nbsp; "
+        f"target position {sig.get('target_position', 0.0):+.0%} &nbsp; "
+        f"forecast vol {sig.get('vol_forecast', 0.0):.0%}</div>",
         unsafe_allow_html=True,
     )
 
@@ -109,31 +105,32 @@ def signal_card(title: str, signal: dict, subtitle: str = "") -> None:
         if not signal:
             st.info("No signal - run scripts/run_baseline.py")
             return
-        prob = signal.get("prob_up", 0.5)
-        conf = signal.get("confidence", 0.0)
-        pos = signal.get("position", 0.0)
+        trend = signal.get("trend_signal", 0.0)
+        vol_f = signal.get("vol_forecast", 0.0)
+        pos = signal.get("target_position", 0.0)
         st.markdown(
-            f"<span style='font-size:1.8rem;font-weight:700;color:{_color(prob)}'>"
-            f"{_direction(prob)}</span> &nbsp;"
+            f"<span style='font-size:1.8rem;font-weight:700;color:{_color(trend)}'>"
+            f"{_trend_direction(trend)}</span> &nbsp;"
             f"<span style='color:#888'>as of {signal.get('asof', '')}</span>",
             unsafe_allow_html=True,
         )
-        has_pos = "position" in signal
-        cols = st.columns(3 if has_pos else 2)
-        cols[0].metric("Prob up", f"{prob:.1%}")
-        cols[1].metric("Confidence", f"{conf:.1%}",
-                       help="meta-model probability the direction call is correct")
-        if has_pos:
-            cols[2].metric("Suggested position", f"{pos:+.1%}")
-        st.progress(min(1.0, max(0.0, conf)), text="confidence")
-        if "meta_prob" in signal:
-            st.caption(f"meta P(call correct): {signal['meta_prob']:.1%}")
+        cols = st.columns(3)
+        cols[0].metric("Trend signal", f"{trend:+.2f}",
+                       help="vol-normalized momentum blend, -1..+1")
+        cols[1].metric("Forecast vol", f"{vol_f:.1%}",
+                       help="model's forward realized-volatility forecast")
+        cols[2].metric("Target position", f"{pos:+.0%}")
+        st.progress(min(1.0, abs(trend)), text="trend conviction")
+        rv = signal.get("realized_vol_20d")
+        if rv is not None and not (isinstance(rv, float) and np.isnan(rv)):
+            st.caption(f"recent 20d realized vol: {rv:.1%}")
         by_h = signal.get("by_horizon")
         if by_h:
             hc = st.columns(len(by_h))
             for col, (h, vals) in zip(hc, by_h.items()):
-                col.metric(f"{h} prob_up", f"{vals['prob_up']:.1%}",
-                           delta=f"std {vals['prob_std']:.2f}", delta_color="off")
+                col.metric(f"{h}d vol forecast", f"{vals['vol_fcst']:.1%}",
+                           delta=f"±{vals['vol_fcst_std']:.1%}",
+                           delta_color="off")
 
 
 # --- signal explainer -----------------------------------------------------
@@ -144,16 +141,17 @@ def explainer_panel(asset: str) -> None:
         st.caption("No driver breakdown available.")
         return
     df = pd.DataFrame(drivers)
-    df["direction"] = np.where(df["contribution"] >= 0, "pushes up", "pushes down")
+    df["direction"] = np.where(df["contribution"] >= 0,
+                               "raises vol", "lowers vol")
     chart = alt.Chart(df).mark_bar().encode(
-        x=alt.X("contribution:Q", title="log-odds contribution"),
+        x=alt.X("contribution:Q", title="volatility-forecast contribution"),
         y=alt.Y("feature:N", sort="-x"),
         color=alt.Color("direction:N",
-                        scale=alt.Scale(domain=["pushes up", "pushes down"],
-                                        range=["#1f9d55", "#c53030"])),
+                        scale=alt.Scale(domain=["raises vol", "lowers vol"],
+                                        range=["#c53030", "#1f9d55"])),
         tooltip=["feature", "contribution"],
     )
-    st.caption("What is driving today's daily signal (per-prediction SHAP)")
+    st.caption("What is driving today's volatility forecast (per-prediction SHAP)")
     st.altair_chart(chart, use_container_width=True)
 
 
@@ -198,6 +196,7 @@ def backtest_panel(asset: str, metrics: dict) -> None:
         metrics_summary(metrics)
         st.info("No backtest predictions yet.")
         return
+    metrics_summary(metrics)
     bt = bt.sort_index()
     dates = pd.to_datetime(bt.index)
     lo, hi = dates.min().to_pydatetime(), dates.max().to_pydatetime()
@@ -220,8 +219,11 @@ def backtest_panel(asset: str, metrics: dict) -> None:
     c[0].metric("Window return", f"{equity.iloc[-1] - 1:.1%}")
     c[1].metric("Window Sharpe", f"{sharpe:.2f}")
     c[2].metric("Buy & hold return", f"{bh.iloc[-1] - 1:.1%}")
-    chart = pd.DataFrame({"strategy": equity, "buy & hold": bh})
-    st.line_chart(chart)
+    chart = {"strategy": equity, "buy & hold": bh}
+    if "vt_bh_equity" in sl.columns:
+        vt = (1 + sl["vt_bh_pnl"].fillna(0)).cumprod()
+        chart["vol-targeted b&h"] = vt
+    st.line_chart(pd.DataFrame(chart))
     st.caption("Model exposure")
     st.area_chart(sl[["book"]].rename(columns={"book": "exposure"}))
 
@@ -239,50 +241,46 @@ def metrics_summary(metrics: dict) -> None:
                 delta=f"buy&hold {bench.get('cagr', 0):.1%}", delta_color="off")
     c[2].metric("Max drawdown", f"{strat.get('max_dd', 0):.1%}",
                 delta=f"buy&hold {bench.get('max_dd', 0):.1%}", delta_color="off")
-    c[3].metric("Directional hit", f"{metrics.get('hit_rate', 0):.1%}")
+    c[3].metric("Sortino", f"{strat.get('sortino', 0):.2f}")
     c2 = st.columns(4)
-    c2[0].metric("Log loss", f"{metrics.get('log_loss', 0):.3f}",
-                 help="below 0.693 = better than a coin flip")
-    c2[1].metric("Brier", f"{metrics.get('brier', 0):.3f}")
-    c2[2].metric("Active periods", metrics.get("n_active", 0),
-                 delta=f"of {metrics.get('n_predictions', 0)}", delta_color="off")
-    c2[3].metric("Avg turnover", f"{metrics.get('avg_turnover', 0):.3f}")
+    c2[0].metric("Vol forecast R2", f"{metrics.get('vol_r2', 0):.3f}",
+                 help="out-of-sample R^2 of the volatility forecast")
+    c2[1].metric("Vol forecast corr", f"{metrics.get('vol_corr', 0):.3f}")
+    c2[2].metric("Avg turnover", f"{metrics.get('avg_turnover', 0):.3f}")
+    c2[3].metric("Trend hit rate", f"{metrics.get('hit_rate', 0):.1%}",
+                 help="secondary - expectancy matters more than hit rate")
 
 
-def equity_chart(df: pd.DataFrame | None) -> None:
-    if df is None or df.empty or "equity" not in df.columns:
-        st.info("No backtest predictions.")
+def vol_forecast_chart(df: pd.DataFrame | None) -> None:
+    if df is None or df.empty \
+            or not {"vol_fcst", "realized_rv"}.issubset(df.columns):
         return
-    st.line_chart(df[["equity", "bh_equity"]].rename(
-        columns={"equity": "strategy", "bh_equity": "buy & hold"}))
-
-
-def confidence_bucket_table(df: pd.DataFrame | None) -> None:
-    if df is None or df.empty or "confidence" not in df.columns:
-        return
-    d = df.dropna(subset=["target_ret"]).copy()
-    bins = pd.cut(d["confidence"], bins=[-0.01, 0.1, 0.3, 0.6, 1.01],
-                  labels=["very_low", "low", "med", "high"])
-    agg = d.groupby(bins, observed=True).agg(
-        n=("dir_correct", "size"), hit_rate=("dir_correct", "mean"),
-        mean_pnl=("pnl", "mean"))
-    st.dataframe(agg.style.format({"hit_rate": "{:.1%}", "mean_pnl": "{:.5f}"}),
-                 use_container_width=True)
-
-
-def calibration_chart(df: pd.DataFrame | None) -> None:
-    if df is None or df.empty or "prob_up" not in df.columns:
-        return
-    d = df.dropna(subset=["prob_up", "target_ret"]).copy()
+    d = df[["vol_fcst", "realized_rv"]].dropna()
     if d.empty:
         return
-    d["bucket"] = (d["prob_up"] * 10).clip(0, 9).astype(int)
-    rel = d.groupby("bucket").agg(predicted=("prob_up", "mean"),
-                                  actual=("target_ret", lambda x: (x > 0).mean()))
-    rel = rel.set_index("predicted")
-    rel["perfect"] = rel.index
-    st.caption("Calibration - 'actual' should track 'perfect'")
-    st.line_chart(rel)
+    st.caption("Forecast vs realized volatility - the lines should track")
+    st.line_chart(d.rename(columns={"vol_fcst": "forecast",
+                                    "realized_rv": "realized"}))
+
+
+def trend_bucket_table(df: pd.DataFrame | None) -> None:
+    if df is None or df.empty or "trend_signal" not in df.columns:
+        return
+    d = df.dropna(subset=["trend_signal", "pnl"]).copy()
+    if d.empty:
+        return
+    d["bucket"] = pd.cut(d["trend_signal"].abs(),
+                         bins=[-0.01, 0.1, 0.3, 0.6, 1.01],
+                         labels=["flat", "weak", "moderate", "strong"])
+    spec = {"n": ("pnl", "size"), "mean_pnl": ("pnl", "mean")}
+    if "dir_correct" in d.columns:
+        spec["hit_rate"] = ("dir_correct", "mean")
+    agg = d.groupby("bucket", observed=True).agg(**spec)
+    fmt = {"mean_pnl": "{:.5f}"}
+    if "hit_rate" in agg.columns:
+        fmt["hit_rate"] = "{:.1%}"
+    st.caption("PnL by trend-signal strength")
+    st.dataframe(agg.style.format(fmt), use_container_width=True)
 
 
 def feature_importance_chart(asset: str) -> None:
@@ -323,48 +321,27 @@ def render_asset(asset: str) -> None:
 
     daily_metrics = _load_json(ART_DIR / f"metrics_daily_{asset}.json")
     st.subheader("Today's signal")
-    signal_card("Daily consensus", daily_metrics.get("latest_signal", {}),
-                subtitle="5d / 10d / 20d ensemble + meta-labelling")
+    signal_card("Volatility-targeted trend",
+                daily_metrics.get("latest_signal", {}),
+                subtitle="forward-vol forecast (5d/10d/20d) sizes a "
+                         "time-series-momentum position")
     with st.expander("Why this signal? (feature drivers)", expanded=True):
         explainer_panel(asset)
 
-    tabs = st.tabs([f"Intraday {lbl}" for lbl in INTRADAY_LABELS])
-    for tab, lbl in zip(tabs, INTRADAY_LABELS):
-        with tab:
-            m = _load_json(ART_DIR / f"metrics_intraday_{asset}_{lbl}.json")
-            signal_card(f"Intraday {lbl} (LightGBM)", m.get("latest_signal", {}),
-                        subtitle=f"forward {lbl} model")
-            nm = _load_json(ART_DIR / f"metrics_neural_{asset}_{lbl}.json")
-            if nm.get("latest_signal"):
-                signal_card(f"Intraday {lbl} (GPU neural / TCN)",
-                            nm.get("latest_signal", {}),
-                            subtitle="Temporal Conv Net")
-
-    st.subheader("Backtest - daily 5d horizon")
+    st.subheader("Backtest - volatility-targeted trend (daily)")
     backtest_panel(asset, daily_metrics)
 
     bt = _load_parquet(ART_DIR / f"daily_predictions_{asset}.parquet")
-    with st.expander("Confidence buckets & calibration"):
-        confidence_bucket_table(bt)
-        calibration_chart(bt)
+    with st.expander("Volatility forecast & trend buckets"):
+        vol_forecast_chart(bt)
+        trend_bucket_table(bt)
     with st.expander("Feature importance (top 20)"):
         feature_importance_chart(asset)
-    with st.expander("Intraday & neural backtests"):
-        for lbl in INTRADAY_LABELS:
-            st.markdown(f"**{lbl} - LightGBM**")
-            metrics_summary(_load_json(ART_DIR / f"metrics_intraday_{asset}_{lbl}.json"))
-            equity_chart(_load_parquet(
-                ART_DIR / f"intraday_predictions_{asset}_{lbl}.parquet"))
-            st.markdown(f"**{lbl} - GPU neural (TCN)**")
-            metrics_summary(_load_json(ART_DIR / f"metrics_neural_{asset}_{lbl}.json"))
-            equity_chart(_load_parquet(
-                ART_DIR / f"neural_predictions_{asset}_{lbl}.parquet"))
-            st.divider()
 
 
 def main() -> None:
     st.set_page_config(page_title="Gold/Silver Signal", layout="wide")
-    st.title("Gold/Silver Signal Dashboard")
+    st.title("Gold/Silver Volatility-Targeted Trend Model")
 
     if not ART_DIR.exists() or not any(ART_DIR.glob("metrics_*.json")):
         st.warning("No artifacts found. Generate them first:")
