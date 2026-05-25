@@ -136,23 +136,10 @@ def load_cot(cftc_codes: list[str], start: str, end: str | None = None) -> pd.Da
 
 
 def load_all(cfg: RunConfig, assets: dict) -> dict[str, pd.DataFrame]:
-    tickers = [a.ticker for a in assets.values()] + list(cfg.macro_tickers.values())
+    tickers = sorted({a.ticker for a in assets.values()}
+                     | set(cfg.macro_tickers.values()))
     prices = load_prices(tickers, cfg.start, cfg.end)
     fred = load_fred(cfg.fred_series, cfg.start, cfg.end)
-    cot = load_cot([a.cftc_code for a in assets.values()], cfg.start, cfg.end)
+    cot_codes = [a.cftc_code for a in assets.values() if a.cftc_code]
+    cot = load_cot(cot_codes, cfg.start, cfg.end) if cot_codes else pd.DataFrame()
     return {"prices": prices, "fred": fred, "cot": cot}
-
-
-def load_intraday(ticker: str, interval: str, period: str) -> pd.DataFrame:
-    df = yf.download(ticker, interval=interval, period=period,
-                     auto_adjust=True, progress=False, threads=False)
-    if df.empty:
-        return df
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    df.columns = ["open", "high", "low", "close", "volume"]
-    df.index = pd.to_datetime(df.index)
-    if getattr(df.index, "tz", None) is not None:
-        df.index = df.index.tz_convert("UTC").tz_localize(None)
-    return df.dropna(subset=["close"])

@@ -1,17 +1,12 @@
-"""End-to-end gold/silver pipeline.
+"""Multi-asset volatility-targeted trend portfolio.
 
-Daily volatility-targeted trend-following model: a multi-horizon LightGBM
-ensemble forecasts forward realized volatility, which sizes a time-series
-momentum position. The retired direction classifier / meta-labelling / TCN
-remain on disk but are opt-in only.
+For each asset in cfg.universe, train a per-asset vol forecast (LightGBM
+ensemble), size a time-series-momentum position by target_vol / vol_fcst,
+walk-forward backtest, and aggregate into an equal-risk-weighted portfolio.
 
 Usage:
-    python scripts/run_baseline.py              # both assets, daily model
-    python scripts/run_baseline.py gold
-    python scripts/run_baseline.py --intraday   # also run retired intraday
-    python scripts/run_baseline.py --intraday --neural
-
-Outputs land in artifacts/ for the Streamlit UI.
+    python scripts/run_baseline.py              # full universe
+    python scripts/run_baseline.py gold silver  # subset by name
 """
 from __future__ import annotations
 
@@ -24,15 +19,12 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.backtest import (evaluate, kelly_size, walk_forward_intraday,
-                          walk_forward_vol_daily)
+from src.backtest import aggregate_portfolio, evaluate, walk_forward_vol_daily
 from src.config import ART_DIR, ASSETS, RunConfig
-from src.data import load_all, load_intraday
-from src.features import build_daily_features, build_intraday_features
-from src.meta import MetaStrategy
+from src.data import load_all
+from src.features import build_daily_features
 from src.model import (explain_primary, predict_vol_multi_horizon,
                        train_vol_multi_horizon)
-from src.neural import HAS_TORCH, neural_latest, neural_predictions
 
 
 def _to_jsonable(obj):
@@ -46,38 +38,8 @@ def _to_jsonable(obj):
 
 
 def _save_metrics(name: str, payload: dict) -> None:
-    out = {}
-    for k, v in payload.items():
-        if k == "by_confidence" and isinstance(v, pd.DataFrame):
-            out[k] = v.reset_index().to_dict(orient="list")
-        else:
-            out[k] = _to_jsonable(v)
-    (ART_DIR / f"metrics_{name}.json").write_text(json.dumps(out, indent=2, default=str))
-
-
-def _signal_from_pred(pred_row: pd.Series, cfg: RunConfig,
-                      horizons=None) -> dict:
-    pos = kelly_size(np.array([pred_row["prob_up"]]),
-                     np.array([pred_row["confidence"]]),
-                     cfg.kelly_fraction, cfg.confidence_threshold)[0]
-    sig = {
-        "asof": str(getattr(pred_row, "name", "")),
-        "prob_up": float(pred_row["prob_up"]),
-        "confidence": float(pred_row["confidence"]),
-        "position": float(pos),
-    }
-    if "meta_prob" in pred_row:
-        sig["meta_prob"] = float(pred_row["meta_prob"])
-    if "dispersion" in pred_row:
-        sig["dispersion"] = float(pred_row["dispersion"])
-    if horizons:
-        sig["by_horizon"] = {
-            str(h): {
-                "prob_up": float(pred_row[f"prob_up_{h}"]),
-                "prob_std": float(pred_row[f"prob_std_{h}"]),
-            } for h in horizons if f"prob_up_{h}" in pred_row
-        }
-    return sig
+    (ART_DIR / f"metrics_{name}.json").write_text(
+        json.dumps(_to_jsonable(payload), indent=2, default=str))
 
 
 def _vol_signal(feat_row: pd.Series, fc_row: pd.Series, cfg: RunConfig) -> dict:
@@ -85,10 +47,6 @@ def _vol_signal(feat_row: pd.Series, fc_row: pd.Series, cfg: RunConfig) -> dict:
     vol_fcst = float(fc_row["vol_fcst"])
     ratio = min(max(cfg.target_vol / vol_fcst, 0.0), cfg.max_leverage)
     pos = trend * ratio
-    if (cfg.vrp_filter and "opt_iv" in feat_row.index
-            and pd.notna(feat_row["opt_iv"])
-            and feat_row["opt_iv"] / vol_fcst > 1.5):
-        pos *= 0.5
     direction = "LONG" if trend > 0.05 else "SHORT" if trend < -0.05 else "FLAT"
     return {
         "asof": str(feat_row.name),
@@ -107,26 +65,26 @@ def _vol_signal(feat_row: pd.Series, fc_row: pd.Series, cfg: RunConfig) -> dict:
     }
 
 
-def run_daily(name: str, data: dict, cfg: RunConfig) -> dict:
+def run_daily(name: str, data: dict, cfg: RunConfig) -> tuple[dict, pd.DataFrame]:
     asset = ASSETS[name]
-    print(f"\n=== DAILY {name.upper()} ({asset.ticker}) ===")
+    print(f"\n=== {name.upper()} ({asset.ticker}) ===")
     feats = build_daily_features(data, asset, cfg)
-    print(f"feature matrix: {feats.shape}, "
+    if feats.empty:
+        print(f"  no feature matrix - skipping {name}")
+        return {"empty": True}, pd.DataFrame()
+    print(f"  feature matrix: {feats.shape}, "
           f"span {feats.index.min().date()} -> {feats.index.max().date()}")
 
     bt = walk_forward_vol_daily(feats, cfg)
     summary = {"empty": True}
+    enriched = pd.DataFrame()
     if not bt.empty:
-        summary, enriched = evaluate(bt, cfg, holding=cfg.backtest_horizon,
-                                     periods_per_year=252)
+        summary, enriched = evaluate(bt, cfg, holding=cfg.backtest_horizon)
         enriched.to_parquet(ART_DIR / f"daily_predictions_{name}.parquet")
-        print("-- strategy     --", summary["strategy"])
-        print("-- buy & hold   --", summary["benchmark"])
-        if "vt_benchmark" in summary:
-            print("-- vol-tgt b&h  --", summary["vt_benchmark"])
-        print(f"vol_r2={summary.get('vol_r2', float('nan')):.3f} "
-              f"vol_corr={summary.get('vol_corr', float('nan')):.3f} "
-              f"trend_hit={summary.get('hit_rate', 0):.3f}")
+        print(f"  strategy Sharpe={summary['strategy']['sharpe']:+.2f}  "
+              f"b&h Sharpe={summary['benchmark']['sharpe']:+.2f}  "
+              f"vol_r2={summary.get('vol_r2', float('nan')):+.3f}  "
+              f"hit={summary.get('hit_rate', 0):.3f}")
 
     rv_col = f"fwd_rv_{cfg.backtest_horizon}d"
     models = train_vol_multi_horizon(feats.dropna(subset=[rv_col]),
@@ -145,91 +103,56 @@ def run_daily(name: str, data: dict, cfg: RunConfig) -> dict:
                         for h, hm in models.items()}, axis=1)
         fi.to_parquet(ART_DIR / f"feature_importance_{name}.parquet")
 
-    _save_metrics(f"daily_{name}", {**summary, "latest_signal": latest_signal})
-    return {"summary": summary, "latest": latest_signal}
-
-
-def run_intraday(name: str, cfg: RunConfig, do_neural: bool) -> dict:
-    asset = ASSETS[name]
-    out_per_h = {}
-    for h in cfg.intraday_horizons:
-        print(f"\n=== INTRADAY {name.upper()} {h.label} ===")
-        bars = load_intraday(asset.ticker, h.interval, h.period)
-        if bars.empty:
-            print(f"  no bars for {asset.ticker} {h.interval}")
-            continue
-        feats = build_intraday_features(bars, h)
-        print(f"  bars: {len(feats)}  span: {feats.index.min()} -> {feats.index.max()}")
-
-        bt = walk_forward_intraday(feats, h, cfg)
-        summary = {"empty": True}
-        if not bt.empty:
-            summary, enriched = evaluate(bt, cfg, holding=h.forward_bars,
-                                         periods_per_year=h.bars_per_year)
-            enriched.to_parquet(ART_DIR / f"intraday_predictions_{name}_{h.label}.parquet")
-            print("-- strategy --", summary["strategy"])
-
-        strat = MetaStrategy([h.label], "target_up", "target_ret", "weight",
-                             n_ensemble=cfg.n_ensemble,
-                             device=cfg.device).fit(feats.dropna(subset=["target_ret"]))
-        latest = {}
-        if strat.ok:
-            latest = _signal_from_pred(strat.predict(feats.iloc[[-1]]).iloc[0],
-                                       cfg, horizons=[h.label])
-        _save_metrics(f"intraday_{name}_{h.label}",
-                      {**summary, "latest_signal": latest})
-
-        neural_info = {}
-        if do_neural and HAS_TORCH:
-            print(f"  [neural] training TCN for {h.label} ...")
-            npred = neural_predictions(feats, "target_up", device=cfg.device)
-            nsummary = {"empty": True}
-            if not npred.empty:
-                nsummary, nenriched = evaluate(npred, cfg, holding=h.forward_bars,
-                                               periods_per_year=h.bars_per_year)
-                nenriched.to_parquet(ART_DIR / f"neural_predictions_{name}_{h.label}.parquet")
-                print("  -- neural strategy --", nsummary["strategy"])
-            nlatest = neural_latest(feats, "target_up", device=cfg.device)
-            _save_metrics(f"neural_{name}_{h.label}",
-                          {**nsummary, "latest_signal": nlatest})
-            neural_info = {"summary": nsummary, "latest": nlatest}
-        elif do_neural:
-            print("  [neural] torch not installed - skipping TCN")
-
-        out_per_h[h.label] = {"summary": summary, "latest": latest,
-                              "neural": neural_info}
-    return out_per_h
+    _save_metrics(f"daily_{name}", {**summary, "latest_signal": latest_signal,
+                                    "ticker": asset.ticker,
+                                    "asset_class": asset.asset_class})
+    return summary, enriched
 
 
 def main(argv: list[str]) -> None:
-    # Daily vol-targeted trend model is the pipeline. Intraday and the neural
-    # TCN are retired direction models - opt in explicitly to run them.
-    do_daily = "--no-daily" not in argv
-    do_intraday = "--intraday" in argv
-    do_neural = "--neural" in argv
-    targets = [a for a in argv[1:] if not a.startswith("--")] or list(ASSETS)
     cfg = RunConfig()
+    requested = [a for a in argv[1:] if not a.startswith("--")]
+    universe = requested or cfg.universe
+    universe = [a for a in universe if a in ASSETS]
+    if not universe:
+        print(f"no valid assets in: {requested}")
+        return
 
-    data = None
-    if do_daily:
-        print(f"Loading daily data ({cfg.start} -> today)...")
-        data = load_all(cfg, ASSETS)
-        print(f"  prices: {data['prices'].shape}  fred: {data['fred'].shape}  "
-              f"cot: {data['cot'].shape}")
+    sub_assets = {n: ASSETS[n] for n in universe}
+    print(f"Loading data for {len(universe)} assets ({cfg.start} -> today)...")
+    data = load_all(cfg, sub_assets)
+    print(f"  prices: {data['prices'].shape}  fred: {data['fred'].shape}  "
+          f"cot: {data['cot'].shape}")
 
-    summary = {}
-    for name in targets:
-        if name not in ASSETS:
-            print(f"unknown asset: {name}")
-            continue
-        summary.setdefault(name, {})
-        if do_daily:
-            summary[name]["daily"] = run_daily(name, data, cfg)
-        if do_intraday:
-            summary[name]["intraday"] = run_intraday(name, cfg, do_neural)
+    per_asset_pred: dict[str, pd.DataFrame] = {}
+    per_asset_summary: dict[str, dict] = {}
+    for name in universe:
+        summary, enriched = run_daily(name, data, cfg)
+        per_asset_summary[name] = summary
+        if not enriched.empty:
+            per_asset_pred[name] = enriched
+
+    print(f"\n=== PORTFOLIO (N={len(per_asset_pred)}, scale={cfg.portfolio_scale}) ===")
+    port_metrics, port_pred = aggregate_portfolio(per_asset_pred, cfg)
+    if not port_pred.empty:
+        port_pred.to_parquet(ART_DIR / "daily_predictions_portfolio.parquet")
+        s = port_metrics["strategy"]
+        b = port_metrics["benchmark"]
+        print(f"  portfolio Sharpe={s['sharpe']:+.2f}  "
+              f"CAGR={s['cagr']:+.1%}  max_dd={s['max_dd']:.1%}")
+        print(f"  equal-weight b&h Sharpe={b['sharpe']:+.2f}  "
+              f"CAGR={b['cagr']:+.1%}  max_dd={b['max_dd']:.1%}")
+        if "vt_benchmark" in port_metrics:
+            v = port_metrics["vt_benchmark"]
+            print(f"  vol-tgt eq-wt b&h Sharpe={v['sharpe']:+.2f}  "
+                  f"CAGR={v['cagr']:+.1%}")
+    _save_metrics("portfolio", port_metrics)
 
     (ART_DIR / "summary.json").write_text(
-        json.dumps(_to_jsonable(summary), indent=2, default=str))
+        json.dumps(_to_jsonable({"universe": universe,
+                                 "portfolio": port_metrics,
+                                 "per_asset": per_asset_summary}),
+                   indent=2, default=str))
     print(f"\nArtifacts written to {ART_DIR}")
 
 

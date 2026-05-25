@@ -3,8 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .config import AssetConfig, IntradayHorizon, RunConfig
-from .labeling import ewma_vol, triple_barrier, uniqueness_weights
+from .config import AssetConfig, RunConfig
 from .options import options_snapshot_features
 
 
@@ -28,6 +27,11 @@ def _price_features(close: pd.Series) -> pd.DataFrame:
     return out
 
 
+# FRED series that are option-implied (handled separately) and so should not
+# pass through the macro feature loop.
+_OPT_IV_SERIES = {"gold_iv"}
+
+
 def _macro_features(prices: pd.DataFrame, fred: pd.DataFrame,
                     cfg: RunConfig) -> pd.DataFrame:
     out = pd.DataFrame(index=prices.index)
@@ -42,7 +46,7 @@ def _macro_features(prices: pd.DataFrame, fred: pd.DataFrame,
     if not fred.empty:
         f = fred.reindex(prices.index).ffill()
         for col in f.columns:
-            if col == "gold_iv":  # handled as an option-market feature
+            if col in _OPT_IV_SERIES:
                 continue
             out[f"fred_{col}_lvl"] = f[col]
             out[f"fred_{col}_chg_5d"] = f[col].diff(5)
@@ -54,9 +58,9 @@ def _macro_features(prices: pd.DataFrame, fred: pd.DataFrame,
     return out
 
 
-def _cot_features(cot: pd.DataFrame, cftc_code: str,
+def _cot_features(cot: pd.DataFrame, cftc_code: str | None,
                   index: pd.DatetimeIndex) -> pd.DataFrame:
-    if cot.empty:
+    if cftc_code is None or cot.empty:
         return pd.DataFrame(index=index)
     sub = cot[cot["cftc_code"] == cftc_code].copy()
     if sub.empty:
@@ -76,19 +80,16 @@ def _cot_features(cot: pd.DataFrame, cftc_code: str,
     return daily
 
 
-def _options_features(close: pd.Series, fred: pd.DataFrame,
-                      snapshots: pd.DataFrame) -> pd.DataFrame:
-    """Option-market features.
+# GVZ is the CBOE Gold ETF Volatility Index - only a meaningful implied-vol
+# signal for precious metals.
+_PM_TICKERS = {"GLD", "SLV"}
 
-    Two sources, deliberately kept separate:
-      * GVZ (CBOE Gold ETF Volatility Index) - ~17 years of option-implied
-        volatility, so these participate in the historical backtest. For
-        silver it serves as a precious-metals implied-vol gauge.
-      * Accumulated live chain snapshots - richer (skew, term structure,
-        put/call flow) but forward-only, so NaN across the backtest and
-        only informative for the live signal as snapshots build up.
-    """
+
+def _options_features(asset: AssetConfig, close: pd.Series, fred: pd.DataFrame,
+                      snapshots: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame(index=close.index)
+    if asset.ticker not in _PM_TICKERS:
+        return out
     r1 = close.pct_change(fill_method=None)
     rv = r1.rolling(20).std() * np.sqrt(252)
 
@@ -100,7 +101,6 @@ def _options_features(close: pd.Series, fred: pd.DataFrame,
         out["opt_iv_chg_20d"] = iv.diff(20)
         out["opt_iv_pctile_252"] = iv.rolling(252).apply(
             lambda w: float((w[-1] >= w).mean()), raw=True)
-        # Variance risk premium: implied minus trailing realized vol.
         out["opt_vrp"] = iv - rv
         out["opt_iv_rv_ratio"] = iv / rv.replace(0, np.nan)
 
@@ -157,56 +157,18 @@ def build_daily_features(data: dict, asset: AssetConfig,
     fred = data["fred"]
     cot = data["cot"]
 
-    close = prices[f"{asset.ticker}_close"]
+    close_col = f"{asset.ticker}_close"
+    if close_col not in prices.columns:
+        return pd.DataFrame()
+    close = prices[close_col]
     feats = _price_features(close)
     feats = feats.join(_macro_features(prices, fred, cfg))
     feats = feats.join(_ratio_features(prices))
     feats = feats.join(_cot_features(cot, asset.cftc_code, prices.index))
-    feats = feats.join(_options_features(close, fred,
+    feats = feats.join(_options_features(asset, close, fred,
                                          options_snapshot_features(asset.ticker)))
 
     feats["trend_signal"] = trend_signal(close, feats["rv_60d"])
     feats = feats.join(vol_targets(close, cfg.daily_horizons))
     feats["close"] = close
     return feats[feats["close"].notna()].copy()
-
-
-def build_intraday_features(bars: pd.DataFrame,
-                            h: IntradayHorizon) -> pd.DataFrame:
-    if bars.empty:
-        return bars
-    close = bars["close"]
-    out = pd.DataFrame(index=bars.index)
-    r1 = close.pct_change(fill_method=None)
-    for w in (1, 2, 4, 8, 20, 40):
-        out[f"ret_{w}b"] = close.pct_change(w, fill_method=None)
-    for w in (20, 50):
-        out[f"rv_{w}b"] = r1.rolling(w).std()
-    out["vol_regime"] = out["rv_20b"] / out["rv_50b"]
-
-    typical = (bars["high"] + bars["low"] + bars["close"]) / 3.0
-    vol = bars["volume"].astype(float).replace(0, np.nan)
-    vwap = (typical * vol).rolling(20).sum() / vol.rolling(20).sum()
-    out["vwap_dev"] = (close - vwap) / vwap
-
-    rng = (bars["high"] - bars["low"]) / close
-    out["range"] = rng
-    out["range_mean_20"] = rng.rolling(20).mean()
-
-    hod = bars.index.hour + bars.index.minute / 60.0
-    out["hod_sin"] = np.sin(2 * np.pi * hod / 24.0)
-    out["hod_cos"] = np.cos(2 * np.pi * hod / 24.0)
-    out["dow"] = bars.index.dayofweek
-
-    tb = triple_barrier(close, ewma_vol(close, span=50),
-                        horizon=h.forward_bars)
-    out["target_ret"] = tb["tb_ret"]
-    out["target_up"] = tb["tb_up"]
-    out["weight"] = uniqueness_weights(tb["tb_t1"])
-    out["close"] = close
-    return out[out["close"].notna()].copy()
-
-
-# Backwards-compat alias for any imports that still expect `build_features`.
-def build_features(data: dict, asset: AssetConfig, cfg: RunConfig) -> pd.DataFrame:
-    return build_daily_features(data, asset, cfg)
