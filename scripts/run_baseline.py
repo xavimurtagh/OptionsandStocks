@@ -5,8 +5,9 @@ ensemble), size a time-series-momentum position by target_vol / vol_fcst,
 walk-forward backtest, and aggregate into an equal-risk-weighted portfolio.
 
 Usage:
-    python scripts/run_baseline.py              # full universe
+    python scripts/run_baseline.py              # full universe (resumes if interrupted)
     python scripts/run_baseline.py gold silver  # subset by name
+    python scripts/run_baseline.py --fresh      # discard cached per-asset artifacts
 """
 from __future__ import annotations
 
@@ -111,26 +112,59 @@ def run_daily(name: str, data: dict, cfg: RunConfig) -> tuple[dict, pd.DataFrame
 
 def main(argv: list[str]) -> None:
     cfg = RunConfig()
+    fresh = "--fresh" in argv
     requested = [a for a in argv[1:] if not a.startswith("--")]
     universe = requested or cfg.universe
     universe = [a for a in universe if a in ASSETS]
     if not universe:
         print(f"no valid assets in: {requested}")
         return
+    if fresh:
+        print("--fresh: removing existing per-asset artifacts")
+        for name in universe:
+            for p in (ART_DIR / f"daily_predictions_{name}.parquet",
+                      ART_DIR / f"metrics_daily_{name}.json",
+                      ART_DIR / f"feature_importance_{name}.parquet"):
+                p.unlink(missing_ok=True)
 
     sub_assets = {n: ASSETS[n] for n in universe}
-    print(f"Loading data for {len(universe)} assets ({cfg.start} -> today)...")
-    data = load_all(cfg, sub_assets)
-    print(f"  prices: {data['prices'].shape}  fred: {data['fred'].shape}  "
-          f"cot: {data['cot'].shape}")
+    # Identify which assets still need a backtest run. Anything with a cached
+    # predictions parquet is loaded as-is; pass --fresh to retrain everything.
+    todo = [n for n in universe
+            if not (ART_DIR / f"daily_predictions_{n}.parquet").exists()]
+    done = [n for n in universe if n not in todo]
+    if done:
+        print(f"resuming: {len(done)} cached  ({', '.join(done)})")
+    print(f"to train: {len(todo)}  ({', '.join(todo) if todo else 'none'})")
+
+    data = None
+    if todo:
+        print(f"Loading data for {len(todo)} assets ({cfg.start} -> today)...")
+        data = load_all(cfg, {n: ASSETS[n] for n in todo})
+        print(f"  prices: {data['prices'].shape}  fred: {data['fred'].shape}  "
+              f"cot: {data['cot'].shape}")
 
     per_asset_pred: dict[str, pd.DataFrame] = {}
     per_asset_summary: dict[str, dict] = {}
     for name in universe:
-        summary, enriched = run_daily(name, data, cfg)
-        per_asset_summary[name] = summary
-        if not enriched.empty:
-            per_asset_pred[name] = enriched
+        cache = ART_DIR / f"daily_predictions_{name}.parquet"
+        if name in done:
+            try:
+                per_asset_pred[name] = pd.read_parquet(cache)
+                meta = json.loads((ART_DIR / f"metrics_daily_{name}.json").read_text()) \
+                    if (ART_DIR / f"metrics_daily_{name}.json").exists() else {}
+                per_asset_summary[name] = {k: v for k, v in meta.items()
+                                           if k != "latest_signal"}
+                print(f"  [cached] {name}")
+            except Exception as e:
+                print(f"  [cache failed] {name}: {e} -- will retrain")
+                done.remove(name)
+                todo.append(name)
+        if name in todo:
+            summary, enriched = run_daily(name, data, cfg)
+            per_asset_summary[name] = summary
+            if not enriched.empty:
+                per_asset_pred[name] = enriched
 
     print(f"\n=== PORTFOLIO (N={len(per_asset_pred)}, scale={cfg.portfolio_scale}) ===")
     port_metrics, port_pred = aggregate_portfolio(per_asset_pred, cfg)
