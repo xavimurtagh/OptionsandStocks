@@ -62,7 +62,12 @@ def walk_forward_vol_daily(df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
         preds.append(out)
         print(f"[wf-vol] {t0.date()}->{t1.date()} n_train={len(train)} "
               f"n_test={len(test)} mean_vol_fcst={out['vol_fcst'].mean():.3f}")
-    return pd.concat(preds).sort_index() if preds else pd.DataFrame()
+    if not preds:
+        return pd.DataFrame()
+    result = pd.concat(preds).sort_index()
+    # Adjacent folds share a boundary day via inclusive `.loc[t0:t1]`; the later
+    # fold's prediction is the one trained on more data, so keep that.
+    return result[~result.index.duplicated(keep="last")]
 
 
 def _stats(rets: pd.Series, periods_per_year: int = 252) -> dict:
@@ -165,6 +170,10 @@ def aggregate_portfolio(per_asset: dict[str, pd.DataFrame],
     for name, df in per_asset.items():
         if df is None or df.empty:
             continue
+        # Older cached parquets may carry duplicate index labels from the
+        # inclusive walk-forward slicing; collapse them defensively.
+        if df.index.has_duplicates:
+            df = df[~df.index.duplicated(keep="last")]
         if "pnl" in df.columns:
             pnls[name] = df["pnl"]
         if "bh_pnl" in df.columns:
