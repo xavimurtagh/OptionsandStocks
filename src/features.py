@@ -151,6 +151,40 @@ def trend_signal(close: pd.Series, rv_60d: pd.Series) -> pd.Series:
     return acc / len(lookbacks)
 
 
+def _cross_sectional_zscore(prices: pd.DataFrame, tickers: list[str],
+                            lookback: int, invert: bool = False) -> pd.DataFrame:
+    """Cross-sectional z-score of past `lookback`-day return across `tickers`.
+
+    Returns a wide frame (date x ticker) of tanh-normalized z-scores in
+    [-1, 1]. With `invert=True` the sign is flipped, giving the classical
+    value/reversal signal (assets that have underperformed look attractive).
+    """
+    cols = {t: prices[f"{t}_close"] for t in tickers
+            if f"{t}_close" in prices.columns}
+    if not cols:
+        return pd.DataFrame()
+    closes = pd.DataFrame(cols)
+    rets = closes.pct_change(lookback, fill_method=None)
+    mean = rets.mean(axis=1, skipna=True)
+    std = rets.std(axis=1, skipna=True).replace(0, np.nan)
+    z = rets.sub(mean, axis=0).div(std, axis=0)
+    if invert:
+        z = -z
+    return np.tanh(z / 1.5)
+
+
+def cross_sectional_momentum(prices: pd.DataFrame, tickers: list[str],
+                             lookback: int) -> pd.DataFrame:
+    """Long top relative performers / short bottom, in [-1, 1] per asset per day."""
+    return _cross_sectional_zscore(prices, tickers, lookback, invert=False)
+
+
+def cross_sectional_value(prices: pd.DataFrame, tickers: list[str],
+                          lookback: int) -> pd.DataFrame:
+    """Inverted 5y return: cheap (underperformed) assets get positive signal."""
+    return _cross_sectional_zscore(prices, tickers, lookback, invert=True)
+
+
 def build_daily_features(data: dict, asset: AssetConfig,
                          cfg: RunConfig) -> pd.DataFrame:
     prices = data["prices"]
@@ -169,6 +203,15 @@ def build_daily_features(data: dict, asset: AssetConfig,
                                          options_snapshot_features(asset.ticker)))
 
     feats["trend_signal"] = trend_signal(close, feats["rv_60d"])
+    # Cross-sectional momentum and value are computed across the universe in
+    # run_baseline and passed in via data["xsmom"]/data["value"]; we just
+    # extract this asset's column.
+    for sig_key in ("xsmom", "value"):
+        sig_df = data.get(sig_key)
+        if sig_df is not None and asset.ticker in sig_df.columns:
+            feats[f"{sig_key}_signal"] = sig_df[asset.ticker].reindex(feats.index)
+        else:
+            feats[f"{sig_key}_signal"] = 0.0
     feats = feats.join(vol_targets(close, cfg.daily_horizons))
     feats["close"] = close
     return feats[feats["close"].notna()].copy()

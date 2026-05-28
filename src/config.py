@@ -61,6 +61,15 @@ class RunConfig:
     # Multi-asset diversification lowers portfolio vol to ~target_vol/sqrt(N).
     # portfolio_scale lifts it back toward a typical CTA risk budget.
     portfolio_scale: float = 2.0
+    # Signal combine: per-asset TSMOM + cross-sectional momentum (XSMOM)
+    # + cross-sectional value (5y reversal). Long-only filter + magnitude
+    # threshold gate the combined signal to cut whipsaw on persistent trends.
+    signal_weights: dict = field(default_factory=lambda:
+                                 {"tsmom": 0.5, "xsmom": 0.3, "value": 0.2})
+    long_only: bool = True
+    signal_threshold: float = 0.2
+    xsmom_lookback: int = 252   # 12 months for cross-sectional momentum
+    value_lookback: int = 1260  # 5 years for cross-sectional value (reversal)
     fred_series: dict = field(default_factory=lambda: {
         "real_yield_10y": "DFII10",
         "nominal_yield_10y": "DGS10",

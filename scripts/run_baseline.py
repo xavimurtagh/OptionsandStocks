@@ -1,8 +1,13 @@
 """Multi-asset volatility-targeted trend portfolio.
 
 For each asset in cfg.universe, train a per-asset vol forecast (LightGBM
-ensemble), size a time-series-momentum position by target_vol / vol_fcst,
-walk-forward backtest, and aggregate into an equal-risk-weighted portfolio.
+ensemble) and combine three signals (per-asset TSMOM, cross-sectional
+momentum, cross-sectional value), gated by long-only + magnitude threshold,
+then size the position by target_vol / vol_fcst. Aggregates equal-risk
+into a portfolio.
+
+Cached per-asset parquets from pre-combine schema are auto-detected
+(missing combined_signal column) and force-retrained.
 
 Usage:
     python scripts/run_baseline.py              # full universe (resumes if interrupted)
@@ -23,7 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.backtest import aggregate_portfolio, evaluate, walk_forward_vol_daily
 from src.config import ART_DIR, ASSETS, RunConfig
 from src.data import load_all
-from src.features import build_daily_features
+from src.features import (build_daily_features, cross_sectional_momentum,
+                          cross_sectional_value)
 from src.model import (explain_primary, predict_vol_multi_horizon,
                        train_vol_multi_horizon)
 
@@ -45,13 +51,26 @@ def _save_metrics(name: str, payload: dict) -> None:
 
 def _vol_signal(feat_row: pd.Series, fc_row: pd.Series, cfg: RunConfig) -> dict:
     trend = float(feat_row["trend_signal"])
+    xsmom = float(feat_row.get("xsmom_signal", 0.0) or 0.0)
+    value = float(feat_row.get("value_signal", 0.0) or 0.0)
+    w = cfg.signal_weights
+    combined = (w.get("tsmom", 1.0) * trend
+                + w.get("xsmom", 0.0) * xsmom
+                + w.get("value", 0.0) * value)
+    if cfg.long_only:
+        combined = max(combined, 0.0)
+    if abs(combined) < cfg.signal_threshold:
+        combined = 0.0
     vol_fcst = float(fc_row["vol_fcst"])
     ratio = min(max(cfg.target_vol / vol_fcst, 0.0), cfg.max_leverage)
-    pos = trend * ratio
-    direction = "LONG" if trend > 0.05 else "SHORT" if trend < -0.05 else "FLAT"
+    pos = combined * ratio
+    direction = "LONG" if combined > 0.05 else "SHORT" if combined < -0.05 else "FLAT"
     return {
         "asof": str(feat_row.name),
         "trend_signal": trend,
+        "xsmom_signal": xsmom,
+        "value_signal": value,
+        "combined_signal": combined,
         "trend_direction": direction,
         "vol_forecast": vol_fcst,
         "realized_vol_20d": float(feat_row.get("rv_20d", float("nan"))),
@@ -129,20 +148,44 @@ def main(argv: list[str]) -> None:
 
     sub_assets = {n: ASSETS[n] for n in universe}
     # Identify which assets still need a backtest run. Anything with a cached
-    # predictions parquet is loaded as-is; pass --fresh to retrain everything.
-    todo = [n for n in universe
-            if not (ART_DIR / f"daily_predictions_{n}.parquet").exists()]
-    done = [n for n in universe if n not in todo]
+    # predictions parquet is loaded as-is unless it's from an older signal
+    # schema (missing combined_signal column). Pass --fresh to retrain all.
+    todo, done = [], []
+    for n in universe:
+        p = ART_DIR / f"daily_predictions_{n}.parquet"
+        if not p.exists():
+            todo.append(n)
+            continue
+        try:
+            cached_cols = set(pd.read_parquet(p, columns=None).columns)
+        except Exception:
+            todo.append(n)
+            continue
+        if "combined_signal" not in cached_cols:
+            print(f"  [stale schema] {n} cached without combined_signal -- will retrain")
+            todo.append(n)
+        else:
+            done.append(n)
     if done:
         print(f"resuming: {len(done)} cached  ({', '.join(done)})")
     print(f"to train: {len(todo)}  ({', '.join(todo) if todo else 'none'})")
 
     data = None
     if todo:
-        print(f"Loading data for {len(todo)} assets ({cfg.start} -> today)...")
-        data = load_all(cfg, {n: ASSETS[n] for n in todo})
+        # Always load the full universe so cross-sectional signals have
+        # context across all 16 assets, even when retraining a subset.
+        full_assets = {n: ASSETS[n] for n in cfg.universe}
+        print(f"Loading data for {len(cfg.universe)} assets "
+              f"(XSMOM/value need full-universe context)...")
+        data = load_all(cfg, full_assets)
         print(f"  prices: {data['prices'].shape}  fred: {data['fred'].shape}  "
               f"cot: {data['cot'].shape}")
+        tickers = [a.ticker for a in full_assets.values()]
+        data["xsmom"] = cross_sectional_momentum(
+            data["prices"], tickers, cfg.xsmom_lookback)
+        data["value"] = cross_sectional_value(
+            data["prices"], tickers, cfg.value_lookback)
+        print(f"  xsmom: {data['xsmom'].shape}  value: {data['value'].shape}")
 
     per_asset_pred: dict[str, pd.DataFrame] = {}
     per_asset_summary: dict[str, dict] = {}

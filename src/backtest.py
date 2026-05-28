@@ -48,6 +48,9 @@ def walk_forward_vol_daily(df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
         out = pd.DataFrame(index=test.index)
         out["close"] = test["close"]
         out["trend_signal"] = test["trend_signal"]
+        for sig_col in ("xsmom_signal", "value_signal"):
+            if sig_col in test.columns:
+                out[sig_col] = test[sig_col]
         out["target_ret"] = test[ret_col]
         out["realized_rv"] = test[rv_col]
         if "rv_20d" in test.columns:
@@ -57,8 +60,19 @@ def walk_forward_vol_daily(df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
             col = f"vol_fcst_{hh}"
             if col in fc.columns:
                 out[col] = fc[col]
+        # Weighted-combine TSMOM + XSMOM + value (each already in [-1, 1]).
+        w = cfg.signal_weights
+        combined = w.get("tsmom", 1.0) * test["trend_signal"].fillna(0)
+        if "xsmom_signal" in test.columns:
+            combined = combined + w.get("xsmom", 0.0) * test["xsmom_signal"].fillna(0)
+        if "value_signal" in test.columns:
+            combined = combined + w.get("value", 0.0) * test["value_signal"].fillna(0)
+        if cfg.long_only:
+            combined = combined.clip(lower=0.0)
+        combined = combined.where(combined.abs() >= cfg.signal_threshold, 0.0)
+        out["combined_signal"] = combined
         ratio = (cfg.target_vol / out["vol_fcst"]).clip(0, cfg.max_leverage)
-        out["position"] = out["trend_signal"] * ratio
+        out["position"] = combined * ratio
         preds.append(out)
         print(f"[wf-vol] {t0.date()}->{t1.date()} n_train={len(train)} "
               f"n_test={len(test)} mean_vol_fcst={out['vol_fcst'].mean():.3f}")
