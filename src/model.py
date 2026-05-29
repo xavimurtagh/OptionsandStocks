@@ -243,28 +243,42 @@ def predict_multi_horizon(models_by_h: dict, X_df: pd.DataFrame) -> pd.DataFrame
 def _train_one_reg(X: pd.DataFrame, y, idx: int, device: str,
                    n_estimators: int = 400, eval_set=None) -> LGBMRegressor:
     params = dict(_ENSEMBLE_PARAMS[idx % len(_ENSEMBLE_PARAMS)])
-    kw = dict(
-        n_estimators=n_estimators,
-        subsample=0.8,
-        subsample_freq=1,
-        reg_lambda=1.0,
-        random_state=42 + idx,
-        n_jobs=-1,
-        verbose=-1,
-        device_type=device,
-        objective="regression",
-        metric="l2",
-    )
-    if device in ("gpu", "cuda"):
-        kw["max_bin"] = 255
-    kw.update(params)
-    m = LGBMRegressor(**kw)
-    if eval_set is not None:
-        m.fit(X, y, eval_set=[eval_set],
-              callbacks=[lgb.early_stopping(40, verbose=False)])
-    else:
-        m.fit(X, y)
-    return m
+
+    def _build(dev):
+        kw = dict(
+            n_estimators=n_estimators,
+            subsample=0.8,
+            subsample_freq=1,
+            reg_lambda=1.0,
+            random_state=42 + idx,
+            n_jobs=-1,
+            verbose=-1,
+            device_type=dev,
+            objective="regression",
+            metric="l2",
+        )
+        if dev in ("gpu", "cuda"):
+            kw["max_bin"] = 255
+        kw.update(params)
+        return LGBMRegressor(**kw)
+
+    def _fit(model):
+        if eval_set is not None:
+            model.fit(X, y, eval_set=[eval_set],
+                      callbacks=[lgb.early_stopping(40, verbose=False)])
+        else:
+            model.fit(X, y)
+        return model
+
+    try:
+        return _fit(_build(device))
+    except lgb.basic.LightGBMError as e:
+        # GPU OpenCL errors (-14 = out-of-host-memory, driver hangs, etc.)
+        # surface deep in long runs. Retry on CPU rather than abort.
+        if device in ("gpu", "cuda"):
+            print(f"  [lgbm] {device} failed ({e}); retrying on CPU")
+            return _fit(_build("cpu"))
+        raise
 
 
 @dataclass
