@@ -61,11 +61,15 @@ class RunConfig:
     # Multi-asset diversification lowers portfolio vol to ~target_vol/sqrt(N).
     # portfolio_scale lifts it back toward a typical CTA risk budget.
     portfolio_scale: float = 2.0
-    # Signal combine: per-asset TSMOM + cross-sectional momentum (XSMOM)
-    # + cross-sectional value (5y reversal). Long-only filter + magnitude
+    # Signal combine: per-asset TSMOM + cross-sectional momentum (XSMOM).
+    # 2023 deep-dive (scripts/diagnose_2023.py) showed value (5y reversal) is
+    # standalone-negative over 11 years and drags the combine down, while
+    # XSMOM-only is the strongest leg and the only signal positive in 2023.
+    # Default tilt is XSMOM-heavy with TSMOM kept for crisis-year alpha
+    # (2022 +1.09 Sharpe driven by TSMOM). Long-only filter + magnitude
     # threshold gate the combined signal to cut whipsaw on persistent trends.
     signal_weights: dict = field(default_factory=lambda:
-                                 {"tsmom": 0.5, "xsmom": 0.3, "value": 0.2})
+                                 {"tsmom": 0.3, "xsmom": 0.7, "value": 0.0})
     long_only: bool = True
     signal_threshold: float = 0.2
     xsmom_lookback: int = 252   # 12 months for cross-sectional momentum
