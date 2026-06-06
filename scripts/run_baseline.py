@@ -99,7 +99,8 @@ def run_daily(name: str, data: dict, cfg: RunConfig) -> tuple[dict, pd.DataFrame
     summary = {"empty": True}
     enriched = pd.DataFrame()
     if not bt.empty:
-        summary, enriched = evaluate(bt, cfg, holding=cfg.backtest_horizon)
+        summary, enriched = evaluate(bt, cfg, holding=cfg.backtest_horizon,
+                                     ticker=asset.ticker)
         enriched.to_parquet(ART_DIR / f"daily_predictions_{name}.parquet")
         print(f"  strategy Sharpe={summary['strategy']['sharpe']:+.2f}  "
               f"b&h Sharpe={summary['benchmark']['sharpe']:+.2f}  "

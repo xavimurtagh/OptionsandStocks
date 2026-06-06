@@ -51,7 +51,18 @@ class RunConfig:
     train_min_years: int = 5
     step_days: int = 21
     n_ensemble: int = 5
-    cost_bps: float = 2.0      # round-trip transaction cost per unit turnover
+    cost_bps: float = 5.0      # fallback round-trip cost (bps) for unlisted tickers
+    # Per-ticker round-trip cost in bps (half-spread + baseline impact); the
+    # single source of truth consumed by src/costs.py. Replaces the old flat 2bps
+    # that flattered illiquid names. Anything unlisted falls back to cost_bps;
+    # tune these to your broker's realized fills.
+    cost_model: dict = field(default_factory=lambda: {
+        "SPY": 1.0, "IEF": 2.0, "TLT": 2.0, "GLD": 2.0, "HYG": 3.0,
+        "EFA": 3.0, "EEM": 4.0, "SLV": 4.0, "UUP": 4.0, "VNQ": 4.0,
+        "GDX": 4.0, "FXE": 5.0, "USO": 6.0, "DBC": 6.0, "GDXJ": 6.0,
+        "FXY": 8.0, "CPER": 12.0, "UNG": 12.0,
+    })
+    impact_coef: float = 0.0   # linear market-impact coefficient (0 = off)
     device: str = "auto"       # auto | cpu | gpu | cuda  (LightGBM device_type)
     daily_horizons: list = field(default_factory=lambda: [5, 10, 20])
     backtest_horizon: int = 5  # which daily horizon to use for backtest PnL

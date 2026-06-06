@@ -4,7 +4,49 @@ import numpy as np
 import pandas as pd
 
 from .config import RunConfig
+from .costs import turnover_cost
 from .model import predict_vol_multi_horizon, train_vol_multi_horizon
+
+
+def combine_signal(test: pd.DataFrame, cfg: RunConfig) -> pd.Series:
+    """Weighted combine of TSMOM + cross-sectional momentum + value (each in
+    [-1, 1]), gated by the long-only filter and magnitude threshold.
+
+    Single source of truth for the signal combine so the production backtest
+    (walk_forward_vol_daily), the live signal (run_baseline._vol_signal) and the
+    validation harness all size positions identically.
+    """
+    w = cfg.signal_weights
+    combined = w.get("tsmom", 1.0) * test["trend_signal"].fillna(0)
+    if "xsmom_signal" in test.columns:
+        combined = combined + w.get("xsmom", 0.0) * test["xsmom_signal"].fillna(0)
+    if "value_signal" in test.columns:
+        combined = combined + w.get("value", 0.0) * test["value_signal"].fillna(0)
+    if cfg.long_only:
+        combined = combined.clip(lower=0.0)
+    return combined.where(combined.abs() >= cfg.signal_threshold, 0.0)
+
+
+def combine_and_size(test: pd.DataFrame, fc: pd.DataFrame,
+                     cfg: RunConfig) -> pd.DataFrame:
+    """Assemble the per-row signal/forecast/position frame from a feature window
+    and its vol forecast. Position = combined_signal * (target_vol / vol_fcst),
+    leverage-capped."""
+    out = pd.DataFrame(index=test.index)
+    out["close"] = test["close"]
+    out["trend_signal"] = test["trend_signal"]
+    for sig_col in ("xsmom_signal", "value_signal"):
+        if sig_col in test.columns:
+            out[sig_col] = test[sig_col]
+    out["vol_fcst"] = fc["vol_fcst"]
+    for hh in cfg.daily_horizons:
+        col = f"vol_fcst_{hh}"
+        if col in fc.columns:
+            out[col] = fc[col]
+    out["combined_signal"] = combine_signal(test, cfg)
+    ratio = (cfg.target_vol / out["vol_fcst"]).clip(0, cfg.max_leverage)
+    out["position"] = out["combined_signal"] * ratio
+    return out
 
 
 def walk_forward_vol_daily(df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
@@ -45,34 +87,11 @@ def walk_forward_vol_daily(df: pd.DataFrame, cfg: RunConfig) -> pd.DataFrame:
         fc = predict_vol_multi_horizon(models, test)
         if "vol_fcst" not in fc.columns:
             continue
-        out = pd.DataFrame(index=test.index)
-        out["close"] = test["close"]
-        out["trend_signal"] = test["trend_signal"]
-        for sig_col in ("xsmom_signal", "value_signal"):
-            if sig_col in test.columns:
-                out[sig_col] = test[sig_col]
+        out = combine_and_size(test, fc, cfg)
         out["target_ret"] = test[ret_col]
         out["realized_rv"] = test[rv_col]
         if "rv_20d" in test.columns:
             out["rv_20d"] = test["rv_20d"]  # naive vol-forecast baseline
-        out["vol_fcst"] = fc["vol_fcst"]
-        for hh in cfg.daily_horizons:
-            col = f"vol_fcst_{hh}"
-            if col in fc.columns:
-                out[col] = fc[col]
-        # Weighted-combine TSMOM + XSMOM + value (each already in [-1, 1]).
-        w = cfg.signal_weights
-        combined = w.get("tsmom", 1.0) * test["trend_signal"].fillna(0)
-        if "xsmom_signal" in test.columns:
-            combined = combined + w.get("xsmom", 0.0) * test["xsmom_signal"].fillna(0)
-        if "value_signal" in test.columns:
-            combined = combined + w.get("value", 0.0) * test["value_signal"].fillna(0)
-        if cfg.long_only:
-            combined = combined.clip(lower=0.0)
-        combined = combined.where(combined.abs() >= cfg.signal_threshold, 0.0)
-        out["combined_signal"] = combined
-        ratio = (cfg.target_vol / out["vol_fcst"]).clip(0, cfg.max_leverage)
-        out["position"] = combined * ratio
         preds.append(out)
         print(f"[wf-vol] {t0.date()}->{t1.date()} n_train={len(train)} "
               f"n_test={len(test)} mean_vol_fcst={out['vol_fcst'].mean():.3f}")
@@ -103,8 +122,12 @@ def _stats(rets: pd.Series, periods_per_year: int = 252) -> dict:
 
 
 def evaluate(pred: pd.DataFrame, cfg: RunConfig,
-             holding: int) -> tuple[dict, pd.DataFrame]:
-    """Mark-to-market the volatility-targeted trend strategy with costs."""
+             holding: int, ticker: str | None = None) -> tuple[dict, pd.DataFrame]:
+    """Mark-to-market the volatility-targeted trend strategy with costs.
+
+    ``ticker`` selects the per-asset cost from the cost model (src/costs.py);
+    None falls back to cfg.cost_bps so older callers keep working.
+    """
     if pred is None or pred.empty:
         return {"empty": True}, pd.DataFrame()
     pred = pred.sort_index().copy()
@@ -120,7 +143,7 @@ def evaluate(pred: pd.DataFrame, cfg: RunConfig,
     turnover = pred["book"].diff().abs()
     turnover.iloc[0] = abs(pred["book"].iloc[0])
     pred["turnover"] = turnover
-    pred["cost"] = turnover * (cfg.cost_bps / 1e4)
+    pred["cost"] = turnover_cost(turnover, ticker, cfg)
 
     pred["pnl"] = pred["book"] * pred["fwd1"] - pred["cost"]
     pred["bh_pnl"] = pred["fwd1"]
