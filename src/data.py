@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from pathlib import Path
 
@@ -16,6 +17,22 @@ def _cache_path(name: str) -> Path:
     return DATA_DIR / f"{name}.parquet"
 
 
+def _retry(fn, attempts: int = 4, base: float = 2.0, label: str = ""):
+    """Call fn() with exponential backoff. Raises the last error if all fail."""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - network errors are varied
+            last = e
+            if label:
+                print(f"[{label}] attempt {i + 1}/{attempts} failed: "
+                      f"{str(e)[:120]}")
+            if i < attempts - 1:
+                time.sleep(base ** i)
+    raise last
+
+
 def load_prices(tickers: list[str], start: str, end: str | None = None,
                 use_cache: bool = True) -> pd.DataFrame:
     cache = _cache_path("prices_" + "_".join(sorted(tickers)))
@@ -23,8 +40,20 @@ def load_prices(tickers: list[str], start: str, end: str | None = None,
         df = pd.read_parquet(cache)
         if df.index.max() >= pd.Timestamp(end or pd.Timestamp.today().normalize()) - pd.Timedelta(days=2):
             return df
-    raw = yf.download(tickers, start=start, end=end, auto_adjust=True,
-                      progress=False, group_by="ticker", threads=True)
+    try:
+        raw = _retry(lambda: yf.download(
+            tickers, start=start, end=end, auto_adjust=True, progress=False,
+            group_by="ticker", threads=True), label="prices")
+    except Exception as e:
+        if cache.exists():
+            print(f"[prices] download failed ({str(e)[:80]}); using stale cache")
+            return pd.read_parquet(cache)
+        raise
+    if raw is None or len(raw) == 0:
+        if cache.exists():
+            print("[prices] empty download; using stale cache")
+            return pd.read_parquet(cache)
+        raise RuntimeError("price download returned no data and no cache exists")
     frames = []
     for tk in tickers:
         if (tk, "Close") in raw.columns:
@@ -39,31 +68,78 @@ def load_prices(tickers: list[str], start: str, end: str | None = None,
     return out
 
 
+_FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
+
+
+def _fetch_fred_series(code: str, start: str, end: str | None,
+                       timeout: int = 60) -> pd.Series:
+    """Fetch one FRED series as a CSV via requests (retried). More controllable
+    than pandas_datareader: explicit timeout + exponential backoff."""
+    def _get():
+        r = requests.get(_FRED_CSV.format(code=code), timeout=timeout)
+        r.raise_for_status()
+        return r.text
+
+    text = _retry(_get, label=f"fred:{code}")
+    df = pd.read_csv(io.StringIO(text))
+    date_col = df.columns[0]                       # DATE / observation_date
+    idx = pd.to_datetime(df[date_col], errors="coerce")
+    s = pd.to_numeric(df.iloc[:, 1], errors="coerce")  # "." -> NaN
+    s = pd.Series(s.values, index=idx).dropna()
+    s.index = s.index.tz_localize(None)
+    if start:
+        s = s[s.index >= pd.Timestamp(start)]
+    if end:
+        s = s[s.index <= pd.Timestamp(end)]
+    return s
+
+
 def load_fred(series: dict[str, str], start: str, end: str | None = None,
               use_cache: bool = True) -> pd.DataFrame:
-    from pandas_datareader import data as pdr
     cache = _cache_path("fred_" + "_".join(sorted(series.values())))
     if use_cache and cache.exists():
         df = pd.read_parquet(cache)
         if df.index.max() >= pd.Timestamp(end or pd.Timestamp.today().normalize()) - pd.Timedelta(days=7):
             return df
+
     frames = {}
     for label, code in series.items():
         try:
-            s = pdr.DataReader(code, "fred", start, end)
-            frames[label] = s[code]
-        except Exception as e:
-            print(f"[fred] {label} ({code}) failed: {e}")
+            frames[label] = _fetch_fred_series(code, start, end)
+        except Exception as e:  # noqa: BLE001
+            print(f"[fred] {label} ({code}) failed after retries: {str(e)[:100]}")
+
     if not frames:
+        # Network down entirely - reuse a stale cache rather than silently
+        # dropping every macro feature (which badly handicaps gold/silver).
+        if cache.exists():
+            print("[fred] all downloads failed; using stale cached copy")
+            return pd.read_parquet(cache)
+        print("[fred] all downloads failed and no cache exists - "
+              "macro features will be missing this run")
         return pd.DataFrame()
+
     out = pd.concat(frames, axis=1).sort_index()
     out.index = pd.to_datetime(out.index).tz_localize(None)
     out = out.ffill()
+    # Partial failure: keep any previously-cached columns we couldn't refresh.
+    if cache.exists():
+        old = pd.read_parquet(cache)
+        for col in old.columns:
+            if col not in out.columns:
+                print(f"[fred] keeping cached '{col}' (refresh failed)")
+                out[col] = old[col].reindex(out.index).ffill()
     out.to_parquet(cache)
     return out
 
 
 _COT_URL = "https://www.cftc.gov/files/dea/history/fut_disagg_txt_{year}.zip"
+
+
+def _cot_get(year: int):
+    r = requests.get(_COT_URL.format(year=year), timeout=90)
+    r.raise_for_status()
+    return r
 
 # CFTC column names drift between years (whitespace, double underscores,
 # date format). Normalize to lowercase-alphanumeric and look up via this map.
@@ -93,8 +169,13 @@ def _fetch_cot_year(year: int) -> pd.DataFrame:
     cache = _cache_path(f"cot_v{_COT_CACHE_VERSION}_{year}")
     if cache.exists() and year < pd.Timestamp.today().year:
         return pd.read_parquet(cache)
-    r = requests.get(_COT_URL.format(year=year), timeout=60)
-    r.raise_for_status()
+    try:
+        r = _retry(lambda: _cot_get(year), label=f"cot:{year}")
+    except Exception:
+        if cache.exists():
+            print(f"[cot] {year} download failed; using stale cache")
+            return pd.read_parquet(cache)
+        raise
     with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
         name = next(n for n in zf.namelist() if n.lower().endswith(".txt"))
         with zf.open(name) as fh:

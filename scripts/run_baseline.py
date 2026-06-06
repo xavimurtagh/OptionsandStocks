@@ -132,8 +132,10 @@ def run_daily(name: str, data: dict, cfg: RunConfig) -> tuple[dict, pd.DataFrame
 
 def main(argv: list[str]) -> None:
     cfg = RunConfig()
-    fresh = "--fresh" in argv
-    requested = [a for a in argv[1:] if not a.startswith("--")]
+    fresh_tokens = {"--fresh", "-f", "fresh", "refresh"}
+    fresh = any(a in fresh_tokens for a in argv)
+    requested = [a for a in argv[1:]
+                 if not a.startswith("--") and a not in fresh_tokens]
     universe = requested or cfg.universe
     universe = [a for a in universe if a in ASSETS]
     if not universe:
@@ -181,6 +183,9 @@ def main(argv: list[str]) -> None:
         data = load_all(cfg, full_assets)
         print(f"  prices: {data['prices'].shape}  fred: {data['fred'].shape}  "
               f"cot: {data['cot'].shape}")
+        if data["fred"].empty:
+            print("  [WARN] FRED macro features unavailable (network) - "
+                  "gold/silver models are degraded this run.")
         tickers = [a.ticker for a in full_assets.values()]
         data["xsmom"] = cross_sectional_momentum(
             data["prices"], tickers, cfg.xsmom_lookback)
@@ -194,12 +199,27 @@ def main(argv: list[str]) -> None:
         cache = ART_DIR / f"daily_predictions_{name}.parquet"
         if name in done:
             try:
-                per_asset_pred[name] = pd.read_parquet(cache)
-                meta = json.loads((ART_DIR / f"metrics_daily_{name}.json").read_text()) \
-                    if (ART_DIR / f"metrics_daily_{name}.json").exists() else {}
-                per_asset_summary[name] = {k: v for k, v in meta.items()
-                                           if k != "latest_signal"}
-                print(f"  [cached] {name}")
+                cached = pd.read_parquet(cache)
+                # Re-mark-to-market with the CURRENT cost model so cost-config
+                # changes show up without an expensive retrain. (Sizing changes
+                # still need --fresh, since position is fixed at train time.)
+                summary, enriched = evaluate(cached, cfg,
+                                             holding=cfg.backtest_horizon,
+                                             ticker=ASSETS[name].ticker)
+                if enriched.empty:
+                    raise ValueError("re-evaluate produced no rows")
+                enriched.to_parquet(cache)
+                meta_path = ART_DIR / f"metrics_daily_{name}.json"
+                latest = (json.loads(meta_path.read_text()).get("latest_signal", {})
+                          if meta_path.exists() else {})
+                _save_metrics(f"daily_{name}",
+                              {**summary, "latest_signal": latest,
+                               "ticker": ASSETS[name].ticker,
+                               "asset_class": ASSETS[name].asset_class})
+                per_asset_pred[name] = enriched
+                per_asset_summary[name] = summary
+                print(f"  [cached, re-costed] {name}  "
+                      f"Sharpe={summary['strategy']['sharpe']:+.2f}")
             except Exception as e:
                 print(f"  [cache failed] {name}: {e} -- will retrain")
                 done.remove(name)

@@ -128,6 +128,11 @@ def main(argv: list[str]) -> None:
     full_assets = {n: ASSETS[n] for n in cfg.universe}
     print(f"Loading data for {len(full_assets)} assets (xsmom/value context)...")
     data = load_all(cfg, full_assets)
+    if data["fred"].empty:
+        print("[WARN] FRED macro features unavailable this run (network) - "
+              "real yields / DXY / VIX / GVZ are missing, which badly handicaps\n"
+              "       gold/silver. Re-run when fred.stlouisfed.org is reachable "
+              "to seed the cache; numbers below are degraded.")
     tickers = [a.ticker for a in full_assets.values()]
     data["xsmom"] = cross_sectional_momentum(data["prices"], tickers, cfg.xsmom_lookback)
     data["value"] = cross_sectional_value(data["prices"], tickers, cfg.value_lookback)

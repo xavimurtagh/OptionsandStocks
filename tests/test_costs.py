@@ -53,3 +53,25 @@ def test_impact_adds_cost_when_enabled():
     base = turnover_cost(turnover, "GLD", RunConfig()).iloc[0]
     with_impact = turnover_cost(turnover, "GLD", cfg, adv_proxy=adv).iloc[0]
     assert with_impact > base
+
+
+def test_evaluate_recost_per_asset_and_idempotent():
+    """Underpins run_baseline's resume path: re-running evaluate on cached
+    predictions refreshes costs per-asset and is stable on a second pass."""
+    from src.backtest import evaluate
+
+    n = 300
+    idx = pd.bdate_range("2018-01-01", periods=n)
+    rng = np.random.default_rng(0)
+    close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0, 0.01, n))), index=idx)
+    pred = pd.DataFrame({"close": close,
+                         "position": rng.uniform(0, 1, n),
+                         "vol_fcst": 0.15}, index=idx)
+    cfg = RunConfig()
+    _, cheap = evaluate(pred.copy(), cfg, holding=5, ticker="SPY")    # 1bp
+    _, dear = evaluate(pred.copy(), cfg, holding=5, ticker="UNG")     # 12bp
+    assert dear["cost"].sum() > cheap["cost"].sum()
+    # Re-evaluating the enriched output with the same ticker reproduces costs.
+    _, again = evaluate(cheap.copy(), cfg, holding=5, ticker="SPY")
+    assert np.allclose(cheap["cost"].to_numpy(), again["cost"].to_numpy(),
+                       equal_nan=True)
