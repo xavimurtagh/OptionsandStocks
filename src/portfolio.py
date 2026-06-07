@@ -83,9 +83,19 @@ def carry_signal_panel(fred: pd.DataFrame | None, tickers: list[str],
     def col(name):
         return fred[name].reindex(idx).ffill() if name in fred.columns else None
 
-    slope = None
-    if {"nominal_yield_10y", "short_yield_2y"}.issubset(fred.columns):
-        slope = np.tanh((col("nominal_yield_10y") - col("short_yield_2y")) / 1.5)
+    def first(names):
+        for n in names:
+            c = col(n)
+            if c is not None:
+                return c
+        return None
+
+    # Term-structure carry: 10y minus a short rate. Prefer FRED's 2y; fall back
+    # to the 3m bill (the classic 10y-3m slope) sourced from Yahoo when FRED is
+    # unreachable, so bond carry runs without depending on FRED.
+    ten = first(["nominal_yield_10y", "nominal_yield_10y_yf"])
+    short = first(["short_yield_2y", "short_yield_3m"])
+    slope = np.tanh((ten - short) / 1.5) if ten is not None and short is not None else None
     for t in CARRY_BOND_TICKERS:
         if t in carry.columns and slope is not None:
             carry[t] = slope

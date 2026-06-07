@@ -109,3 +109,10 @@ class RunConfig:
         "tlt_m": "TLT", "tip_m": "TIP", "uup_m": "UUP",
         "spy_m": "SPY", "copper_m": "HG=F",
     })
+    # US Treasury yields from Yahoo (CBOE rate indices). A fallback source for
+    # the yield-curve term spread behind bond carry, used when FRED is
+    # unreachable - yfinance loads reliably in environments where FRED times out.
+    yf_yield_tickers: dict = field(default_factory=lambda: {
+        "short_yield_3m": "^IRX",          # 13-week T-bill
+        "nominal_yield_10y_yf": "^TNX",    # 10-year note
+    })

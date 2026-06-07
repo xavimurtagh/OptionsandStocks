@@ -88,6 +88,31 @@ def test_load_fred_per_series_cache_degrades_gracefully(monkeypatch, tmp_path):
     assert set(df2.columns) == {"a", "b"}
 
 
+def test_load_yields_yf_rescales_and_labels(monkeypatch):
+    """Yahoo yields are mapped to carry's labels and x10-quoted history is
+    rescaled to percent."""
+    idx = pd.bdate_range("2020-01-01", periods=6)
+    px = pd.DataFrame({
+        "^IRX_close": [1.5, 1.6, 1.5, 1.4, 1.5, 1.6],        # already percent
+        "^TNX_close": [25.0, 24.0, 26.0, 25.5, 24.5, 25.0],  # legacy x10 -> ~2.5%
+    }, index=idx)
+    monkeypatch.setattr(data, "load_prices", lambda *a, **k: px)
+    out = data.load_yields_yf(
+        {"short_yield_3m": "^IRX", "nominal_yield_10y_yf": "^TNX"}, "2020-01-01")
+    assert set(out.columns) == {"short_yield_3m", "nominal_yield_10y_yf"}
+    assert out["nominal_yield_10y_yf"].median() < 5      # rescaled from ~25
+    assert abs(out["short_yield_3m"].median() - 1.5) < 0.2
+
+
+def test_load_yields_yf_empty_on_failure(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("yf down")
+
+    monkeypatch.setattr(data, "load_prices", boom)
+    assert data.load_yields_yf({"short_yield_3m": "^IRX"}, "2020-01-01").empty
+    assert data.load_yields_yf({}, "2020-01-01").empty
+
+
 def test_load_fred_recovers_legacy_combined_cache(monkeypatch, tmp_path):
     """A pre-upgrade combined cache (columns by label) is recovered when FRED is
     down, so switching to per-series caching never loses existing data."""

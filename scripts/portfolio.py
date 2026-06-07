@@ -54,8 +54,8 @@ def main(argv: list[str]) -> None:
     panel = assemble_panel(data, cfg)
     carried = [t for t in panel["tickers"] if panel["carry"][t].abs().sum() > 0]
     print(f"Carry active on {len(carried)} assets: {', '.join(carried) or 'none'}"
-          + ("  [FRED down -> add DGS2/HY OAS when reachable]" if len(carried) < 5
-             else ""))
+          + ("  [partial: bonds need ^IRX/^TNX (yfinance) or DGS2; HYG needs "
+             "HY OAS]" if len(carried) < 5 else ""))
     bt = portfolio_backtest(panel, cfg)
     if bt.empty:
         print("No portfolio PnL produced."); return

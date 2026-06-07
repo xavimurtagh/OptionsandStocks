@@ -70,6 +70,19 @@ def test_carry_signal_signs_and_coverage():
     assert carry["SPY"].abs().sum() == 0
 
 
+def test_bond_carry_runs_from_yahoo_curve():
+    """Bond carry must work off the Yahoo 3m/10y curve when FRED's 2y is gone
+    (the real-world case: FRED down, yfinance up)."""
+    data, cfg = _synth_data(), _cfg()
+    f = data["fred"].copy()
+    f["nominal_yield_10y_yf"] = f["nominal_yield_10y"]
+    f["short_yield_3m"] = f["nominal_yield_10y"] - 1.0    # steep 10y-3m slope
+    f = f.drop(columns=["short_yield_2y", "nominal_yield_10y"])  # FRED curve gone
+    carry = carry_signal_panel(f, ["TLT", "IEF", "SPY"], data["prices"].index)
+    assert carry["TLT"].abs().sum() > 0                   # bond carry still fires
+    assert carry["SPY"].abs().sum() == 0
+
+
 def test_carry_disabled_without_fred():
     panel = assemble_panel({"prices": _synth_data()["prices"],
                             "fred": pd.DataFrame(), "cot": pd.DataFrame()}, _cfg())

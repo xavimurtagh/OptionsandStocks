@@ -250,11 +250,47 @@ def load_cot(cftc_codes: list[str], start: str, end: str | None = None) -> pd.Da
     return df
 
 
+def load_yields_yf(yield_tickers: dict[str, str], start: str,
+                   end: str | None = None, use_cache: bool = True) -> pd.DataFrame:
+    """US Treasury yields from Yahoo (CBOE rate indices like ^IRX, ^TNX).
+
+    yfinance loads reliably in environments where FRED times out, so this is the
+    fallback source for the yield-curve term spread that drives bond carry.
+    Yahoo has quoted these in percent (4.2) and, historically, x10 (42); we
+    auto-detect and rescale to percent."""
+    if not yield_tickers:
+        return pd.DataFrame()
+    try:
+        px = load_prices(list(yield_tickers.values()), start, end,
+                         use_cache=use_cache)
+    except Exception as e:  # noqa: BLE001
+        print(f"[yields] yfinance Treasury yields unavailable: {str(e)[:80]}")
+        return pd.DataFrame()
+    out = {}
+    for label, tk in yield_tickers.items():
+        s = px.get(f"{tk}_close")
+        if s is None:
+            continue
+        s = s.dropna()
+        if len(s) and s.median() > 20:        # legacy x10 quoting -> percent
+            s = s / 10.0
+        if len(s):
+            out[label] = s
+    return pd.DataFrame(out).sort_index() if out else pd.DataFrame()
+
+
 def load_all(cfg: RunConfig, assets: dict) -> dict[str, pd.DataFrame]:
     tickers = sorted({a.ticker for a in assets.values()}
                      | set(cfg.macro_tickers.values()))
     prices = load_prices(tickers, cfg.start, cfg.end)
     fred = load_fred(cfg.fred_series, cfg.start, cfg.end)
+    # Supplement FRED with Yahoo-sourced Treasury yields so the curve-based
+    # signals survive FRED outages. These add columns (short_yield_3m,
+    # nominal_yield_10y_yf) that carry falls back to when FRED's 2y/10y are gone.
+    ylds = load_yields_yf(getattr(cfg, "yf_yield_tickers", {}), cfg.start, cfg.end)
+    if not ylds.empty:
+        fred = ylds if fred.empty else fred.join(ylds, how="outer").sort_index()
+        fred = fred.ffill()
     cot_codes = [a.cftc_code for a in assets.values() if a.cftc_code]
     cot = load_cot(cot_codes, cfg.start, cfg.end) if cot_codes else pd.DataFrame()
     return {"prices": prices, "fred": fred, "cot": cot}
