@@ -72,6 +72,16 @@ class RunConfig:
     # Multi-asset diversification lowers portfolio vol to ~target_vol/sqrt(N).
     # portfolio_scale lifts it back toward a typical CTA risk budget.
     portfolio_scale: float = 2.0
+    # --- Return-seeking portfolio engine (src/portfolio.py) ---------------
+    # Unlike the static portfolio_scale above, the portfolio engine measures
+    # the diversified book's realized vol and dynamically levers it to a target,
+    # which is how higher cross-asset Sharpe is converted into return.
+    portfolio_target_vol: float = 0.15  # match a single risky asset's vol
+    max_gross_leverage: float = 4.0     # cap on sum |weights| across the book
+    vol_span: int = 40                  # EWMA span for per-asset + book vol
+    macro_weight: float = 0.0           # weight on the real-yield macro signal
+    regime_filter: bool = False         # cut gross when SPY < 200d trend
+    regime_floor: float = 0.3           # min gross multiplier when risk-off
     # Signal combine: per-asset TSMOM + cross-sectional momentum (XSMOM).
     # 2023 deep-dive (scripts/diagnose_2023.py) showed value (5y reversal) is
     # standalone-negative over 11 years and drags the combine down, while
