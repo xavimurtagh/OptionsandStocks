@@ -80,6 +80,7 @@ class RunConfig:
     max_gross_leverage: float = 4.0     # cap on sum |weights| across the book
     vol_span: int = 40                  # EWMA span for per-asset + book vol
     macro_weight: float = 0.0           # weight on the real-yield macro signal
+    carry_weight: float = 0.0           # weight on the cross-asset carry signal
     regime_filter: bool = False         # cut gross when SPY < 200d trend
     regime_floor: float = 0.3           # min gross multiplier when risk-off
     # Signal combine: per-asset TSMOM + cross-sectional momentum (XSMOM).
@@ -98,6 +99,8 @@ class RunConfig:
     fred_series: dict = field(default_factory=lambda: {
         "real_yield_10y": "DFII10",
         "nominal_yield_10y": "DGS10",
+        "short_yield_2y": "DGS2",     # carry: 10y-2y term spread (bond carry)
+        "hy_oas": "BAMLH0A0HYM2",     # carry: high-yield credit spread (HYG carry)
         "dxy": "DTWEXBGS",
         "vix": "VIXCLS",        # global equity vol regime
         "gold_iv": "GVZCLS",    # precious-metals option-implied vol (GLD/SLV only)

@@ -40,6 +40,8 @@ def main(argv: list[str]) -> None:
     cfg.max_gross_leverage = float(_flag(argv, "--maxlev", cfg.max_gross_leverage))
     if "--macro" in argv:
         cfg.macro_weight = 0.3
+    if "--carry" in argv:
+        cfg.carry_weight = 0.3
     if "--regime" in argv:
         cfg.regime_filter = True
 
@@ -50,13 +52,17 @@ def main(argv: list[str]) -> None:
         print("[WARN] FRED unavailable - macro tilt disabled this run.")
 
     panel = assemble_panel(data, cfg)
+    carried = [t for t in panel["tickers"] if panel["carry"][t].abs().sum() > 0]
+    print(f"Carry active on {len(carried)} assets: {', '.join(carried) or 'none'}"
+          + ("  [FRED down -> add DGS2/HY OAS when reachable]" if len(carried) < 5
+             else ""))
     bt = portfolio_backtest(panel, cfg)
     if bt.empty:
         print("No portfolio PnL produced."); return
 
     print(f"\n=== PORTFOLIO  (target_vol={cfg.portfolio_target_vol:.0%}, "
           f"max_gross={cfg.max_gross_leverage:g}x, macro_w={cfg.macro_weight:g}, "
-          f"regime={cfg.regime_filter}) ===")
+          f"carry_w={cfg.carry_weight:g}, regime={cfg.regime_filter}) ===")
     print(f"{'strategy':<22}{'Sharpe':>8}{'CAGR':>8}{'maxDD':>8}{'Calmar':>8}")
     print("-" * 54)
     print(_row("portfolio", series_stats(bt["pnl"]),

@@ -94,43 +94,77 @@ def _fetch_fred_series(code: str, start: str, end: str | None,
     return s
 
 
+def _legacy_fred_frame(series: dict[str, str]) -> dict[str, pd.Series]:
+    """Best-effort recovery of pre-per-series *combined* caches so existing data
+    survives the switch to per-series caching without a re-fetch. Old combined
+    files stored columns by label (real_yield_10y, ...); map those back so a
+    FRED outage right after an upgrade doesn't wipe the macro panel."""
+    out: dict[str, pd.Series] = {}
+    for p in sorted(DATA_DIR.glob("fred_*.parquet")):
+        if p.name.startswith("fred_series_"):
+            continue  # already per-series
+        try:
+            df = pd.read_parquet(p)
+        except Exception:  # noqa: BLE001
+            continue
+        for label in series:
+            if label not in out and label in df.columns:
+                out[label] = df[label].dropna()
+    return out
+
+
+def _load_one_fred(code: str, start: str, end: str | None, use_cache: bool,
+                   seed: pd.Series | None = None) -> pd.Series | None:
+    """One FRED series with its own cache file. Resolution order: fresh
+    per-series cache -> refresh from FRED -> stale per-series cache -> legacy
+    seed -> None. Each series is independent, so adding or losing one never
+    affects the others."""
+    cache = _cache_path(f"fred_series_{code}")
+    horizon = pd.Timestamp(end or pd.Timestamp.today().normalize())
+    if use_cache and cache.exists():
+        try:
+            cached = pd.read_parquet(cache).iloc[:, 0].dropna()
+            if len(cached) and cached.index.max() >= horizon - pd.Timedelta(days=7):
+                return cached
+            if len(cached):
+                seed = cached  # stale; keep as a fallback after trying refresh
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        s = _fetch_fred_series(code, start, end)
+        pd.DataFrame({code: s}).to_parquet(cache)
+        return s
+    except Exception as e:  # noqa: BLE001
+        if seed is not None and len(seed):
+            print(f"[fred:{code}] refresh failed; using cached copy "
+                  f"({str(e)[:60]})")
+            try:
+                pd.DataFrame({code: seed}).to_parquet(cache)  # migrate forward
+            except Exception:  # noqa: BLE001
+                pass
+            return seed
+        print(f"[fred:{code}] failed and no cache: {str(e)[:80]}")
+        return None
+
+
 def load_fred(series: dict[str, str], start: str, end: str | None = None,
               use_cache: bool = True) -> pd.DataFrame:
-    cache = _cache_path("fred_" + "_".join(sorted(series.values())))
-    if use_cache and cache.exists():
-        df = pd.read_parquet(cache)
-        if df.index.max() >= pd.Timestamp(end or pd.Timestamp.today().normalize()) - pd.Timedelta(days=7):
-            return df
-
+    """Per-series cached FRED loader. Each series is fetched and cached
+    independently, so adding a new series never orphans the others and a partial
+    outage degrades gracefully (stale columns) instead of dropping the whole
+    macro panel."""
+    legacy = _legacy_fred_frame(series) if use_cache else {}
     frames = {}
     for label, code in series.items():
-        try:
-            frames[label] = _fetch_fred_series(code, start, end)
-        except Exception as e:  # noqa: BLE001
-            print(f"[fred] {label} ({code}) failed after retries: {str(e)[:100]}")
-
+        s = _load_one_fred(code, start, end, use_cache, seed=legacy.get(label))
+        if s is not None and len(s):
+            frames[label] = s
     if not frames:
-        # Network down entirely - reuse a stale cache rather than silently
-        # dropping every macro feature (which badly handicaps gold/silver).
-        if cache.exists():
-            print("[fred] all downloads failed; using stale cached copy")
-            return pd.read_parquet(cache)
-        print("[fred] all downloads failed and no cache exists - "
-              "macro features will be missing this run")
+        print("[fred] no series available - macro features missing this run")
         return pd.DataFrame()
-
     out = pd.concat(frames, axis=1).sort_index()
     out.index = pd.to_datetime(out.index).tz_localize(None)
-    out = out.ffill()
-    # Partial failure: keep any previously-cached columns we couldn't refresh.
-    if cache.exists():
-        old = pd.read_parquet(cache)
-        for col in old.columns:
-            if col not in out.columns:
-                print(f"[fred] keeping cached '{col}' (refresh failed)")
-                out[col] = old[col].reindex(out.index).ffill()
-    out.to_parquet(cache)
-    return out
+    return out.ffill()
 
 
 _COT_URL = "https://www.cftc.gov/files/dea/history/fut_disagg_txt_{year}.zip"

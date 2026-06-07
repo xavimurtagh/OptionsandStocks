@@ -45,6 +45,16 @@ from .validation import probability_backtest_overfitting
 # fitting a beta per asset. Extendable (e.g. long-duration bonds are also < 0).
 MACRO_RY_BETA = {"GLD": -1.0, "SLV": -1.0, "GDX": -1.0, "GDXJ": -1.0}
 
+# Assets whose carry we can source honestly from FRED. Bond/credit carry are
+# textbook premia, nearly uncorrelated with momentum, and pay regardless of
+# trend - exactly the diversifying return needed to lift Sharpe past a long-only
+# momentum book. Commodity roll carry (USO/UNG/DBC) is the biggest carry in the
+# universe but needs futures term-structure data we don't have; FX/equity carry
+# need per-currency rates / dividend yields. Both are documented TODOs.
+CARRY_BOND_TICKERS = ("TLT", "IEF")        # term-structure carry (10y-2y slope)
+CARRY_CREDIT_TICKERS = ("HYG",)            # credit carry (high-yield OAS)
+CARRY_METAL_TICKERS = ("GLD", "SLV")       # cost-of-carry (-real yield level)
+
 
 def _ewma_vol(rets: pd.DataFrame, span: int) -> pd.DataFrame:
     return rets.ewm(span=span, min_periods=span // 2).std() * np.sqrt(252)
@@ -54,6 +64,47 @@ def _zscore(s: pd.Series, window: int = 252) -> pd.Series:
     mu = s.rolling(window, min_periods=window // 2).mean()
     sd = s.rolling(window, min_periods=window // 2).std().replace(0, np.nan)
     return (s - mu) / sd
+
+
+def carry_signal_panel(fred: pd.DataFrame | None, tickers: list[str],
+                       idx: pd.Index, window: int = 504) -> pd.DataFrame:
+    """Deterministic cross-asset carry in [-1, 1] per asset (date x asset).
+
+    Bond carry  = tanh(10y-2y term spread): steep curve -> long duration.
+    Credit carry= tanh(z(HY OAS)): wide spreads -> harvest the credit premium.
+    Metal carry = tanh(-z(real yield level)): negative real yields cheapen the
+                  cost of holding non-yielding metal -> long.
+    Carry pays independent of trend, so it fires on assets momentum ignores.
+    """
+    carry = pd.DataFrame(0.0, index=idx, columns=tickers)
+    if fred is None or fred.empty:
+        return carry
+
+    def col(name):
+        return fred[name].reindex(idx).ffill() if name in fred.columns else None
+
+    slope = None
+    if {"nominal_yield_10y", "short_yield_2y"}.issubset(fred.columns):
+        slope = np.tanh((col("nominal_yield_10y") - col("short_yield_2y")) / 1.5)
+    for t in CARRY_BOND_TICKERS:
+        if t in carry.columns and slope is not None:
+            carry[t] = slope
+
+    oas = col("hy_oas")
+    if oas is not None:
+        credit = np.tanh(_zscore(oas, window))
+        for t in CARRY_CREDIT_TICKERS:
+            if t in carry.columns:
+                carry[t] = credit
+
+    ry = col("real_yield_10y")
+    if ry is not None:
+        metal = np.tanh(-_zscore(ry, window))
+        for t in CARRY_METAL_TICKERS:
+            if t in carry.columns:
+                carry[t] = metal
+
+    return carry.fillna(0.0)
 
 
 def assemble_panel(data: dict, cfg: RunConfig) -> dict:
@@ -83,12 +134,14 @@ def assemble_panel(data: dict, cfg: RunConfig) -> dict:
             if beta:   # e.g. metals: beta<0 -> falling yields give +signal
                 macro[t] = np.tanh(beta * ry_chg_z / 1.5)
 
+    carry = carry_signal_panel(fred, tickers, closes.index)
+
     def _al(df):
         return df.reindex(index=closes.index, columns=tickers)
 
     return {"close": closes, "ret": rets, "tsmom": _al(tsmom),
             "xsmom": _al(xsmom), "value": _al(value), "macro": macro,
-            "tickers": tickers}
+            "carry": carry, "tickers": tickers}
 
 
 def combined_signal_panel(panel: dict, cfg: RunConfig) -> pd.DataFrame:
@@ -97,6 +150,10 @@ def combined_signal_panel(panel: dict, cfg: RunConfig) -> pd.DataFrame:
            + w.get("xsmom", 0.0) * panel["xsmom"].fillna(0)
            + w.get("value", 0.0) * panel["value"].fillna(0)
            + cfg.macro_weight * panel["macro"].fillna(0))
+    carry = panel.get("carry")
+    if cfg.carry_weight and carry is not None and not carry.empty:
+        sig = sig + cfg.carry_weight * carry.reindex(
+            index=sig.index, columns=sig.columns).fillna(0)
     if cfg.long_only:
         sig = sig.clip(lower=0.0)
     sig = sig.where(sig.abs() >= cfg.signal_threshold, 0.0)
@@ -160,11 +217,11 @@ def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 DEFAULT_PORT_GRID = {
     "weights": {"xsmom": {"tsmom": 0.0, "xsmom": 1.0, "value": 0.0},
-                "blend": {"tsmom": 0.3, "xsmom": 0.7, "value": 0.0},
-                "tsmom": {"tsmom": 1.0, "xsmom": 0.0, "value": 0.0}},
+                "blend": {"tsmom": 0.3, "xsmom": 0.7, "value": 0.0}},
     "long_only": [True, False],
     "portfolio_target_vol": [0.10, 0.15, 0.20],
     "macro_weight": [0.0, 0.3],
+    "carry_weight": [0.0, 0.3],
 }
 
 
@@ -174,10 +231,13 @@ def expand_port_grid(base: RunConfig, grid: dict) -> list[tuple[str, RunConfig]]
         for lo in grid["long_only"]:
             for tv in grid["portfolio_target_vol"]:
                 for mw in grid["macro_weight"]:
-                    cfg = replace(base, signal_weights=dict(wv), long_only=lo,
-                                  portfolio_target_vol=tv, macro_weight=mw)
-                    out.append((f"{wn}|{'L' if lo else 'LS'}|tv{tv:g}|mw{mw:g}",
-                                cfg))
+                    for cw in grid.get("carry_weight", [0.0]):
+                        cfg = replace(base, signal_weights=dict(wv),
+                                      long_only=lo, portfolio_target_vol=tv,
+                                      macro_weight=mw, carry_weight=cw)
+                        out.append(
+                            (f"{wn}|{'L' if lo else 'LS'}|tv{tv:g}"
+                             f"|mw{mw:g}|cw{cw:g}", cfg))
     return out
 
 

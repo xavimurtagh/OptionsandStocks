@@ -7,33 +7,39 @@ import pandas as pd
 
 from src.config import RunConfig
 from src.portfolio import (DEFAULT_PORT_GRID, MACRO_RY_BETA, assemble_panel,
-                           combined_signal_panel, expand_port_grid,
-                           portfolio_backtest, portfolio_sweep)
+                           carry_signal_panel, combined_signal_panel,
+                           expand_port_grid, portfolio_backtest, portfolio_sweep)
 
 
 def _synth_data(n=900, seed=0):
     rng = np.random.default_rng(seed)
     idx = pd.bdate_range("2015-01-01", periods=n)
-    tickers = ["SPY", "GLD", "SLV", "TLT"]
+    tickers = ["SPY", "GLD", "SLV", "TLT", "HYG"]
     px = {f"{t}_close": 100 * np.exp(np.cumsum(0.0003 + 0.0001 * i
                                                + rng.normal(0, 0.01, n)))
           for i, t in enumerate(tickers)}
     ry = pd.Series(1.0 + np.cumsum(rng.normal(0, 0.02, n)) * 0.1, index=idx)
-    return {"prices": pd.DataFrame(px, index=idx),
-            "fred": pd.DataFrame({"real_yield_10y": ry}),
+    slope = pd.Series(np.cumsum(rng.normal(0, 0.03, n)) * 0.1, index=idx)  # +/-
+    fred = pd.DataFrame({
+        "real_yield_10y": ry,
+        "nominal_yield_10y": ry + 2.0,
+        "short_yield_2y": ry + 2.0 - slope,             # 10y-2y = slope
+        "hy_oas": 4.0 + np.cumsum(rng.normal(0, 0.02, n)) * 0.1,
+    }, index=idx)
+    return {"prices": pd.DataFrame(px, index=idx), "fred": fred,
             "cot": pd.DataFrame()}
 
 
 def _cfg():
     c = RunConfig()
-    c.universe = ["spy", "gold", "silver", "tlt"]
+    c.universe = ["spy", "gold", "silver", "tlt", "hyg"]
     return c
 
 
 def test_assemble_panel_shapes_and_macro_sign():
     data, cfg = _synth_data(), _cfg()
     panel = assemble_panel(data, cfg)
-    assert set(panel["tickers"]) == {"SPY", "GLD", "SLV", "TLT"}
+    assert set(panel["tickers"]) == {"SPY", "GLD", "SLV", "TLT", "HYG"}
     for key in ("close", "ret", "tsmom", "xsmom", "value", "macro"):
         assert len(panel[key]) == 900
     # Metals tilt is bullish when real yields fall: macro signal moves opposite
@@ -44,6 +50,42 @@ def test_assemble_panel_shapes_and_macro_sign():
     assert MACRO_RY_BETA["GLD"] < 0
     # Assets without a known real-yield beta get no macro tilt.
     assert panel["macro"]["SPY"].abs().sum() == 0
+
+
+def test_carry_signal_signs_and_coverage():
+    data, cfg = _synth_data(), _cfg()
+    panel = assemble_panel(data, cfg)
+    carry = panel["carry"]
+    f = data["fred"]
+    # Bond carry tracks the 10y-2y slope (steep -> long duration).
+    slope = f["nominal_yield_10y"] - f["short_yield_2y"]
+    v = pd.concat([carry["TLT"], slope], axis=1).dropna()
+    assert v.iloc[:, 0].corr(v.iloc[:, 1]) > 0.5
+    # Credit carry rises with the HY spread; metal carry falls with real yields.
+    vc = pd.concat([carry["HYG"], f["hy_oas"]], axis=1).dropna()
+    assert vc.iloc[:, 0].corr(vc.iloc[:, 1]) > 0
+    vm = pd.concat([carry["GLD"], f["real_yield_10y"]], axis=1).dropna()
+    assert vm.iloc[:, 0].corr(vm.iloc[:, 1]) < 0
+    # Assets without a sourceable carry get exactly zero.
+    assert carry["SPY"].abs().sum() == 0
+
+
+def test_carry_disabled_without_fred():
+    panel = assemble_panel({"prices": _synth_data()["prices"],
+                            "fred": pd.DataFrame(), "cot": pd.DataFrame()}, _cfg())
+    assert panel["carry"].abs().to_numpy().sum() == 0
+    # carry_signal_panel is robust to a None fred too.
+    z = carry_signal_panel(None, ["SPY", "TLT"], panel["close"].index)
+    assert (z == 0).all().all()
+
+
+def test_carry_weight_changes_the_book():
+    panel = assemble_panel(_synth_data(), _cfg())
+    off = portfolio_backtest(panel, replace(_cfg(), carry_weight=0.0))
+    on = portfolio_backtest(panel, replace(_cfg(), carry_weight=0.5))
+    # Wiring carry in must move the PnL (carry fires on bonds/credit/metals).
+    common = off.index.intersection(on.index)
+    assert not np.allclose(off.loc[common, "pnl"], on.loc[common, "pnl"])
 
 
 def test_combined_signal_long_only_and_threshold():
@@ -76,10 +118,11 @@ def test_higher_target_vol_levers_up():
 
 def test_expand_port_grid_distinct_and_nonmutating():
     cfgs = expand_port_grid(_cfg(), DEFAULT_PORT_GRID)
-    assert len(cfgs) == 3 * 2 * 3 * 2
+    assert len(cfgs) == 2 * 2 * 3 * 2 * 2  # weights x long x tv x macro x carry
     names = [n for n, _ in cfgs]
     assert len(set(names)) == len(names)
     assert RunConfig().signal_weights == {"tsmom": 0.3, "xsmom": 0.7, "value": 0.0}
+    assert RunConfig().carry_weight == 0.0  # base config untouched by the sweep
 
 
 def test_portfolio_sweep_smoke():
