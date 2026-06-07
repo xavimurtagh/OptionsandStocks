@@ -99,12 +99,14 @@ class RunConfig:
     fred_series: dict = field(default_factory=lambda: {
         "real_yield_10y": "DFII10",
         "nominal_yield_10y": "DGS10",
-        "short_yield_2y": "DGS2",     # carry: 10y-2y term spread (bond carry)
         "hy_oas": "BAMLH0A0HYM2",     # carry: high-yield credit spread (HYG carry)
         "dxy": "DTWEXBGS",
         "vix": "VIXCLS",        # global equity vol regime
         "gold_iv": "GVZCLS",    # precious-metals option-implied vol (GLD/SLV only)
     })
+    # Bond-carry short rate comes from Yahoo (^IRX) via yf_yield_tickers, so the
+    # 10y-3m slope needs no FRED 2y series. (DGS2 was dropped: it had no cache
+    # and burned four 60s timeouts every run while FRED is unreachable here.)
     macro_tickers: dict = field(default_factory=lambda: {
         "tlt_m": "TLT", "tip_m": "TIP", "uup_m": "UUP",
         "spy_m": "SPY", "copper_m": "HG=F",
