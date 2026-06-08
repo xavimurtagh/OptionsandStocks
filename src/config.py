@@ -82,6 +82,7 @@ class RunConfig:
     macro_weight: float = 0.0           # weight on the real-yield macro signal
     carry_weight: float = 0.0           # weight on the cross-asset carry signal
     regime_filter: bool = False         # cut gross when SPY < 200d trend
+    regime_credit: bool = False         # also cut gross when HY credit spreads blow out
     regime_floor: float = 0.3           # min gross multiplier when risk-off
     # Signal combine: per-asset TSMOM + cross-sectional momentum (XSMOM).
     # 2023 deep-dive (scripts/diagnose_2023.py) showed value (5y reversal) is

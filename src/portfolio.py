@@ -146,12 +146,19 @@ def assemble_panel(data: dict, cfg: RunConfig) -> dict:
 
     carry = carry_signal_panel(fred, tickers, closes.index)
 
+    # Trailing credit-stress score for the risk-off overlay: HY OAS z-score, high
+    # when spreads are wide (equity-stress regime). Coincident with drawdowns and
+    # trailing-only, so it can time gross without look-ahead.
+    credit_z = None
+    if fred is not None and not fred.empty and "hy_oas" in fred.columns:
+        credit_z = _zscore(fred["hy_oas"].reindex(closes.index).ffill(), 504)
+
     def _al(df):
         return df.reindex(index=closes.index, columns=tickers)
 
     return {"close": closes, "ret": rets, "tsmom": _al(tsmom),
             "xsmom": _al(xsmom), "value": _al(value), "macro": macro,
-            "carry": carry, "tickers": tickers}
+            "carry": carry, "credit_z": credit_z, "tickers": tickers}
 
 
 def combined_signal_panel(panel: dict, cfg: RunConfig) -> pd.DataFrame:
@@ -172,14 +179,25 @@ def combined_signal_panel(panel: dict, cfg: RunConfig) -> pd.DataFrame:
 
 def regime_scalar(panel: dict, cfg: RunConfig) -> pd.Series:
     """Gross-exposure multiplier in [regime_floor, 1]: full risk when SPY is
-    above its 200d average, cut to the floor when below."""
+    above its 200d average, cut to the floor when below. With regime_credit on,
+    also cuts gross as credit spreads (HY OAS) blow out - a coincident risk-off
+    signal that catches fast crashes (e.g. Mar-2020) before the slow 200d filter,
+    taking the more defensive of the two (min)."""
     idx = panel["close"].index
     if not cfg.regime_filter or "SPY" not in panel["close"].columns:
         return pd.Series(1.0, index=idx)
     spy = panel["close"]["SPY"]
     risk_on = spy > spy.rolling(200, min_periods=100).mean()
-    return risk_on.reindex(idx).astype(float).clip(lower=cfg.regime_floor) \
+    trend = risk_on.reindex(idx).astype(float).clip(lower=cfg.regime_floor) \
         .where(risk_on.notna(), 1.0).clip(lower=cfg.regime_floor)
+    cz = panel.get("credit_z")
+    if not getattr(cfg, "regime_credit", False) or cz is None:
+        return trend
+    # Wide spreads (z>1) ramp gross down toward the floor; calm leaves it at 1.
+    cz = cz.reindex(idx).ffill()
+    credit = (1.0 - 0.5 * (cz - 1.0).clip(lower=0.0, upper=2.0)) \
+        .clip(lower=cfg.regime_floor, upper=1.0).where(cz.notna(), 1.0)
+    return pd.concat([trend, credit], axis=1).min(axis=1)
 
 
 def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
@@ -225,29 +243,33 @@ def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Knob sweep with multiple-testing controls (DSR corrected for #configs, PBO). #
 # --------------------------------------------------------------------------- #
+# long_only is fixed True (long/short has lost every sweep in this universe);
+# that freed dimension now A/Bs the credit risk-off overlay (rc) so DSR/PBO judge
+# it. Grid stays at 48 configs: weights(2) x tv(3) x macro(2) x carry(2) x rc(2).
 DEFAULT_PORT_GRID = {
     "weights": {"xsmom": {"tsmom": 0.0, "xsmom": 1.0, "value": 0.0},
                 "blend": {"tsmom": 0.3, "xsmom": 0.7, "value": 0.0}},
-    "long_only": [True, False],
     "portfolio_target_vol": [0.10, 0.15, 0.20],
     "macro_weight": [0.0, 0.3],
     "carry_weight": [0.0, 0.3],
+    "regime_credit": [False, True],
 }
 
 
 def expand_port_grid(base: RunConfig, grid: dict) -> list[tuple[str, RunConfig]]:
     out = []
     for wn, wv in grid["weights"].items():
-        for lo in grid["long_only"]:
-            for tv in grid["portfolio_target_vol"]:
-                for mw in grid["macro_weight"]:
-                    for cw in grid.get("carry_weight", [0.0]):
+        for tv in grid["portfolio_target_vol"]:
+            for mw in grid["macro_weight"]:
+                for cw in grid.get("carry_weight", [0.0]):
+                    for rc in grid.get("regime_credit", [False]):
                         cfg = replace(base, signal_weights=dict(wv),
-                                      long_only=lo, portfolio_target_vol=tv,
-                                      macro_weight=mw, carry_weight=cw)
+                                      long_only=True, portfolio_target_vol=tv,
+                                      macro_weight=mw, carry_weight=cw,
+                                      regime_filter=True, regime_credit=rc)
                         out.append(
-                            (f"{wn}|{'L' if lo else 'LS'}|tv{tv:g}"
-                             f"|mw{mw:g}|cw{cw:g}", cfg))
+                            (f"{wn}|tv{tv:g}|mw{mw:g}|cw{cw:g}"
+                             f"|rc{int(rc)}", cfg))
     return out
 
 

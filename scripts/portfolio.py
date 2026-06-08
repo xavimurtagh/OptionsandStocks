@@ -10,6 +10,8 @@ fool ourselves by picking the lucky leverage/target.
 Usage:
     python scripts/portfolio.py                 # base config + knob sweep
     python scripts/portfolio.py --tv 0.20       # one-off target-vol override
+    python scripts/portfolio.py --macro --carry # real-yield tilt + cross-asset carry
+    python scripts/portfolio.py --regime-credit # SPY-trend + credit-spread risk-off
     python scripts/portfolio.py --no-sweep
 """
 from __future__ import annotations
@@ -44,6 +46,9 @@ def main(argv: list[str]) -> None:
         cfg.carry_weight = 0.3
     if "--regime" in argv:
         cfg.regime_filter = True
+    if "--regime-credit" in argv:            # credit risk-off overlay (implies regime)
+        cfg.regime_filter = True
+        cfg.regime_credit = True
 
     full = {n: ASSETS[n] for n in cfg.universe}
     print(f"Loading {len(full)} assets...")
@@ -60,9 +65,11 @@ def main(argv: list[str]) -> None:
     if bt.empty:
         print("No portfolio PnL produced."); return
 
+    regime_desc = ("trend+credit" if cfg.regime_credit else
+                   "trend" if cfg.regime_filter else "off")
     print(f"\n=== PORTFOLIO  (target_vol={cfg.portfolio_target_vol:.0%}, "
           f"max_gross={cfg.max_gross_leverage:g}x, macro_w={cfg.macro_weight:g}, "
-          f"carry_w={cfg.carry_weight:g}, regime={cfg.regime_filter}) ===")
+          f"carry_w={cfg.carry_weight:g}, regime={regime_desc}) ===")
     print(f"{'strategy':<22}{'Sharpe':>8}{'CAGR':>8}{'maxDD':>8}{'Calmar':>8}")
     print("-" * 54)
     print(_row("portfolio", series_stats(bt["pnl"]),
