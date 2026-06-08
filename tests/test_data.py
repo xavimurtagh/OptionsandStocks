@@ -88,6 +88,35 @@ def test_load_fred_per_series_cache_degrades_gracefully(monkeypatch, tmp_path):
     assert set(df2.columns) == {"a", "b"}
 
 
+def test_load_prices_refetches_when_cache_misses_earlier_start(monkeypatch, tmp_path):
+    """Extending the start (e.g. back to 2005 for the GFC) must refetch, not
+    silently return the shorter cached window."""
+    monkeypatch.setattr(data, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(data.time, "sleep", lambda *_: None)
+    cache = tmp_path / "prices_SPY.parquet"
+    short = pd.DataFrame({"SPY_close": [1.0, 2.0]},
+                         index=pd.bdate_range("2010-01-01", periods=2))
+    short.to_parquet(cache)
+
+    calls = {"n": 0}
+
+    def fake_dl(*a, **k):
+        calls["n"] += 1
+        idx = pd.bdate_range("2005-01-03", "2010-01-05")
+        return pd.DataFrame({("SPY", "Open"): 1.0, ("SPY", "High"): 1.0,
+                             ("SPY", "Low"): 1.0, ("SPY", "Close"): 1.0,
+                             ("SPY", "Volume"): 1.0}, index=idx)
+
+    monkeypatch.setattr(data.yf, "download", fake_dl)
+    # Recent cache, but it starts in 2010 and we ask back to 2005 -> must refetch.
+    out = data.load_prices(["SPY"], "2005-01-01", "2010-01-05")
+    assert calls["n"] == 1
+    assert out.index.min().year == 2005
+    # A second call now fully covered by the cache does not refetch.
+    data.load_prices(["SPY"], "2005-01-01", "2010-01-05")
+    assert calls["n"] == 1
+
+
 def test_load_yields_yf_rescales_and_labels(monkeypatch):
     """Yahoo yields are mapped to carry's labels and x10-quoted history is
     rescaled to percent."""

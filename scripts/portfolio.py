@@ -12,6 +12,7 @@ Usage:
     python scripts/portfolio.py --tv 0.20       # one-off target-vol override
     python scripts/portfolio.py --macro --carry # real-yield tilt + cross-asset carry
     python scripts/portfolio.py --regime-credit # SPY-trend + credit-spread risk-off
+    python scripts/portfolio.py --start 2005-01-01   # span the 2008 GFC (default)
     python scripts/portfolio.py --no-sweep
 """
 from __future__ import annotations
@@ -38,6 +39,7 @@ def _row(label, st, extra=""):
 
 def main(argv: list[str]) -> None:
     cfg = RunConfig()
+    cfg.start = _flag(argv, "--start", cfg.start)
     cfg.portfolio_target_vol = float(_flag(argv, "--tv", cfg.portfolio_target_vol))
     cfg.max_gross_leverage = float(_flag(argv, "--maxlev", cfg.max_gross_leverage))
     if "--macro" in argv:
@@ -64,6 +66,9 @@ def main(argv: list[str]) -> None:
     bt = portfolio_backtest(panel, cfg)
     if bt.empty:
         print("No portfolio PnL produced."); return
+    print(f"Backtest live {bt.index[0].date()} -> {bt.index[-1].date()} "
+          f"({len(bt)} days)"
+          + ("  [spans 2008 GFC]" if bt.index[0].year <= 2007 else ""))
 
     regime_desc = ("trend+credit" if cfg.regime_credit else
                    "trend" if cfg.regime_filter else "off")

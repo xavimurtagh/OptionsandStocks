@@ -46,7 +46,12 @@ ASSETS: dict[str, AssetConfig] = {
 
 @dataclass
 class RunConfig:
-    start: str = "2010-01-01"
+    start: str = "2005-01-01"   # spans the 2008 GFC: the bear-market regime the
+    #                             2013-25 bull sample can't show. Price signals run
+    #                             on full yfinance history; FRED overlays start
+    #                             whenever the macro cache begins (~2010 if FRED is
+    #                             unreachable), so the early years test the
+    #                             momentum/trend/curve core's crash protection.
     end: str | None = None
     train_min_years: int = 5
     step_days: int = 21

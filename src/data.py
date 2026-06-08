@@ -38,7 +38,13 @@ def load_prices(tickers: list[str], start: str, end: str | None = None,
     cache = _cache_path("prices_" + "_".join(sorted(tickers)))
     if use_cache and cache.exists():
         df = pd.read_parquet(cache)
-        if df.index.max() >= pd.Timestamp(end or pd.Timestamp.today().normalize()) - pd.Timedelta(days=2):
+        horizon = pd.Timestamp(end or pd.Timestamp.today().normalize())
+        fresh = df.index.max() >= horizon - pd.Timedelta(days=2)
+        # Also require the cache to reach back to the requested start, so asking
+        # for earlier history (e.g. extending to 2005 to span the GFC) triggers a
+        # refetch instead of silently returning the shorter cached window.
+        covers_start = df.index.min() <= pd.Timestamp(start) + pd.Timedelta(days=10)
+        if fresh and covers_start:
             return df
     try:
         raw = _retry(lambda: yf.download(
