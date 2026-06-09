@@ -200,10 +200,11 @@ def regime_scalar(panel: dict, cfg: RunConfig) -> pd.Series:
     return pd.concat([trend, credit], axis=1).min(axis=1)
 
 
-def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
-    """Mark-to-market the dynamically vol-targeted book plus benchmarks."""
+def _target_weights(panel: dict, cfg: RunConfig) -> pd.DataFrame:
+    """Dated target weights: inverse-vol signal, vol-targeted to
+    portfolio_target_vol, gross-capped, regime-scaled, then turnover-controlled.
+    Factored out so attribution can reuse the exact book the backtest trades."""
     rets = panel["ret"]
-    tickers = panel["tickers"]
     rvol = _ewma_vol(rets, cfg.vol_span).clip(lower=0.02)
     sig = combined_signal_panel(panel, cfg)
 
@@ -233,6 +234,14 @@ def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
             held = np.where(np.abs(W[i] - held) > band, W[i], held)
             out[i] = held
         weights = pd.DataFrame(out, index=weights.index, columns=weights.columns)
+    return weights
+
+
+def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
+    """Mark-to-market the dynamically vol-targeted book plus benchmarks."""
+    rets = panel["ret"]
+    tickers = panel["tickers"]
+    weights = _target_weights(panel, cfg)
     port_ret = (weights.shift(1) * rets).sum(axis=1)
 
     cost = pd.Series(0.0, index=rets.index)

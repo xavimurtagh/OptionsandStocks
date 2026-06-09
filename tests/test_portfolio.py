@@ -7,10 +7,10 @@ import pandas as pd
 import pytest
 
 from src.config import RunConfig
-from src.portfolio import (DEFAULT_PORT_GRID, MACRO_RY_BETA, assemble_panel,
-                           carry_signal_panel, combined_signal_panel,
-                           expand_port_grid, portfolio_backtest, portfolio_sweep,
-                           regime_scalar)
+from src.portfolio import (DEFAULT_PORT_GRID, MACRO_RY_BETA, _target_weights,
+                           assemble_panel, carry_signal_panel,
+                           combined_signal_panel, expand_port_grid,
+                           portfolio_backtest, portfolio_sweep, regime_scalar)
 
 
 def _synth_data(n=900, seed=0):
@@ -92,6 +92,17 @@ def test_carry_disabled_without_fred():
     # carry_signal_panel is robust to a None fred too.
     z = carry_signal_panel(None, ["SPY", "TLT"], panel["close"].index)
     assert (z == 0).all().all()
+
+
+def test_target_weights_reconstructs_backtest_pnl():
+    # Attribution relies on _target_weights being the exact book the backtest
+    # trades: weights.shift(1) . rets must reproduce gross pnl (pnl + cost).
+    panel = assemble_panel(_synth_data(), _cfg())
+    cfg = _cfg()
+    bt = portfolio_backtest(panel, cfg)
+    w = _target_weights(panel, cfg)
+    recon = (w.shift(1) * panel["ret"]).sum(axis=1).reindex(bt.index)
+    assert np.allclose((bt["pnl"] + bt["cost"]).values, recon.values, atol=1e-12)
 
 
 def test_turnover_controls_cut_trading():
