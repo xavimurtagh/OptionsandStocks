@@ -94,6 +94,18 @@ def test_carry_disabled_without_fred():
     assert (z == 0).all().all()
 
 
+def test_turnover_controls_cut_trading():
+    panel = assemble_panel(_synth_data(), _cfg())
+    daily = portfolio_backtest(panel, _cfg())["turnover"].sum()
+    weekly = portfolio_backtest(panel, replace(_cfg(), rebalance_days=5))["turnover"].sum()
+    banded = portfolio_backtest(panel, replace(_cfg(), no_trade_band=0.05))["turnover"].sum()
+    assert weekly < daily      # re-striking every 5d trades less than daily
+    assert banded < daily      # suppressing sub-band moves trades less than daily
+    # Defaults (rebalance_days=1, no_trade_band=0) must reproduce the daily book.
+    base = portfolio_backtest(panel, _cfg())
+    assert base["turnover"].sum() == daily
+
+
 def test_backtest_reports_turnover_and_cost():
     panel = assemble_panel(_synth_data(), _cfg())
     bt = portfolio_backtest(panel, _cfg())

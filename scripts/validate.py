@@ -71,6 +71,8 @@ def main(argv: list[str]) -> None:
     cfg = _champion()
     cfg.start = _flag(argv, "--start", cfg.start)
     cfg.portfolio_target_vol = float(_flag(argv, "--tv", cfg.portfolio_target_vol))
+    cfg.rebalance_days = int(_flag(argv, "--rebal", cfg.rebalance_days))
+    cfg.no_trade_band = float(_flag(argv, "--band", cfg.no_trade_band))
     if "--regime-credit" in argv:
         cfg.regime_credit = True
     fresh = "--fresh" in argv

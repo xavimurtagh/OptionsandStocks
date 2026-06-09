@@ -84,6 +84,12 @@ class RunConfig:
     portfolio_target_vol: float = 0.15  # match a single risky asset's vol
     max_gross_leverage: float = 4.0     # cap on sum |weights| across the book
     vol_span: int = 40                  # EWMA span for per-asset + book vol
+    rebalance_days: int = 1             # re-strike target weights every N trading
+    #                                     days (1 = daily). Momentum/carry are slow,
+    #                                     so daily trading mostly churns noise;
+    #                                     raising this cuts turnover and cost drag.
+    no_trade_band: float = 0.0          # skip trades smaller than this |dweight|
+    #                                     (per asset) - kills tiny vol-target wiggle.
     macro_weight: float = 0.0           # weight on the real-yield macro signal
     carry_weight: float = 0.0           # weight on the cross-asset carry signal
     regime_filter: bool = False         # cut gross when SPY < 200d trend

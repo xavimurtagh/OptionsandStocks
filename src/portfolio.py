@@ -218,6 +218,21 @@ def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
     k = k.clip(lower=0).fillna(0.0) * regime_scalar(panel, cfg)
 
     weights = raw.mul(k, axis=0)
+    # Turnover control: momentum/carry are slow, so daily re-striking mostly
+    # trades noise. Re-strike only every N days and/or suppress sub-band moves;
+    # both default off, so the sweep is unchanged.
+    n_rb = getattr(cfg, "rebalance_days", 1) or 1
+    if n_rb > 1:
+        weights = weights.iloc[::n_rb].reindex(weights.index).ffill().fillna(0.0)
+    band = getattr(cfg, "no_trade_band", 0.0) or 0.0
+    if band > 0:
+        W = weights.to_numpy()
+        out = W.copy()
+        held = W[0].copy()
+        for i in range(1, len(W)):
+            held = np.where(np.abs(W[i] - held) > band, W[i], held)
+            out[i] = held
+        weights = pd.DataFrame(out, index=weights.index, columns=weights.columns)
     port_ret = (weights.shift(1) * rets).sum(axis=1)
 
     cost = pd.Series(0.0, index=rets.index)
