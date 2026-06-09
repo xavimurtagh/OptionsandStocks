@@ -78,7 +78,7 @@ _FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={code}"
 
 
 def _fetch_fred_series(code: str, start: str, end: str | None,
-                       timeout: int = 60) -> pd.Series:
+                       timeout: int = 60, attempts: int = 4) -> pd.Series:
     """Fetch one FRED series as a CSV via requests (retried). More controllable
     than pandas_datareader: explicit timeout + exponential backoff."""
     def _get():
@@ -86,7 +86,7 @@ def _fetch_fred_series(code: str, start: str, end: str | None,
         r.raise_for_status()
         return r.text
 
-    text = _retry(_get, label=f"fred:{code}")
+    text = _retry(_get, attempts=attempts, label=f"fred:{code}")
     df = pd.read_csv(io.StringIO(text))
     date_col = df.columns[0]                       # DATE / observation_date
     idx = pd.to_datetime(df[date_col], errors="coerce")
@@ -130,14 +130,22 @@ def _load_one_fred(code: str, start: str, end: str | None, use_cache: bool,
     if use_cache and cache.exists():
         try:
             cached = pd.read_parquet(cache).iloc[:, 0].dropna()
-            if len(cached) and cached.index.max() >= horizon - pd.Timedelta(days=7):
+            # Macro signals use trailing windows + ffill, so a few weeks of
+            # staleness is harmless; only refresh caches older than ~30d.
+            if len(cached) and cached.index.max() >= horizon - pd.Timedelta(days=30):
                 return cached
             if len(cached):
                 seed = cached  # stale; keep as a fallback after trying refresh
         except Exception:  # noqa: BLE001
             pass
+    # With a usable cache in hand, don't burn 4x60s per series when FRED is
+    # unreachable - try once, briefly, then fall back. A full retry storm only
+    # makes sense when there's no cache at all (or the user forced --fresh).
+    fast = seed is not None and len(seed)
     try:
-        s = _fetch_fred_series(code, start, end)
+        s = _fetch_fred_series(code, start, end,
+                               timeout=15 if fast else 60,
+                               attempts=1 if fast else 4)
         pd.DataFrame({code: s}).to_parquet(cache)
         return s
     except Exception as e:  # noqa: BLE001
@@ -285,15 +293,16 @@ def load_yields_yf(yield_tickers: dict[str, str], start: str,
     return pd.DataFrame(out).sort_index() if out else pd.DataFrame()
 
 
-def load_all(cfg: RunConfig, assets: dict) -> dict[str, pd.DataFrame]:
+def load_all(cfg: RunConfig, assets: dict, use_cache: bool = True) -> dict[str, pd.DataFrame]:
     tickers = sorted({a.ticker for a in assets.values()}
                      | set(cfg.macro_tickers.values()))
-    prices = load_prices(tickers, cfg.start, cfg.end)
-    fred = load_fred(cfg.fred_series, cfg.start, cfg.end)
+    prices = load_prices(tickers, cfg.start, cfg.end, use_cache=use_cache)
+    fred = load_fred(cfg.fred_series, cfg.start, cfg.end, use_cache=use_cache)
     # Supplement FRED with Yahoo-sourced Treasury yields so the curve-based
     # signals survive FRED outages. These add columns (short_yield_3m,
     # nominal_yield_10y_yf) that carry falls back to when FRED's 2y/10y are gone.
-    ylds = load_yields_yf(getattr(cfg, "yf_yield_tickers", {}), cfg.start, cfg.end)
+    ylds = load_yields_yf(getattr(cfg, "yf_yield_tickers", {}), cfg.start,
+                          cfg.end, use_cache=use_cache)
     if not ylds.empty:
         fred = ylds if fred.empty else fred.join(ylds, how="outer").sort_index()
         fred = fred.ffill()

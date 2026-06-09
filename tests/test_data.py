@@ -70,13 +70,29 @@ def test_load_fred_per_series_cache_degrades_gracefully(monkeypatch, tmp_path):
     monkeypatch.setattr(data.time, "sleep", lambda *_: None)
     idx = pd.bdate_range("2020-01-01", periods=8)
 
-    def ok(code, start, end, timeout=60):
+    def ok(code, start, end, timeout=60, attempts=4):
         return pd.Series(range(8), index=idx, dtype=float)
 
     monkeypatch.setattr(data, "_fetch_fred_series", ok)
     df = data.load_fred({"a": "AAA", "b": "BBB"}, "2020-01-01", "2020-01-12")
     assert set(df.columns) == {"a", "b"}
     assert (tmp_path / "fred_series_AAA.parquet").exists()
+
+    # A stale cache must fail fast (1 short attempt), not burn 4x60s, when FRED
+    # is down - and still serve the stale copy.
+    seen = {}
+
+    def rec(code, start, end, timeout=60, attempts=4):
+        seen["timeout"], seen["attempts"] = timeout, attempts
+        raise TimeoutError("down")
+
+    monkeypatch.setattr(data, "_fetch_fred_series", rec)
+    old = pd.bdate_range("2016-01-01", periods=4)   # far older than horizon
+    pd.DataFrame({"AAA": range(4)}, index=old).to_parquet(
+        tmp_path / "fred_series_AAA.parquet")
+    got = data.load_fred({"a": "AAA"}, "2016-01-01", None)
+    assert set(got.columns) == {"a"}                # stale cache still served
+    assert seen == {"timeout": 15, "attempts": 1}   # fast-fail, not 4x60s
 
     # Network down + a brand-new series with no cache: a, b survive from their
     # stale per-series caches; c is dropped, never orphaning the others.

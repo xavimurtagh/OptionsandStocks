@@ -13,6 +13,7 @@ Usage:
     python scripts/portfolio.py --macro --carry # real-yield tilt + cross-asset carry
     python scripts/portfolio.py --regime-credit # SPY-trend + credit-spread risk-off
     python scripts/portfolio.py --start 2005-01-01   # span the 2008 GFC (default)
+    python scripts/portfolio.py --fresh         # bypass caches, force a full refetch
     python scripts/portfolio.py --no-sweep
 """
 from __future__ import annotations
@@ -53,8 +54,9 @@ def main(argv: list[str]) -> None:
         cfg.regime_credit = True
 
     full = {n: ASSETS[n] for n in cfg.universe}
-    print(f"Loading {len(full)} assets...")
-    data = load_all(cfg, full)
+    fresh = "--fresh" in argv          # bypass caches: force a full refetch
+    print(f"Loading {len(full)} assets{' (fresh)' if fresh else ''}...")
+    data = load_all(cfg, full, use_cache=not fresh)
     if data["fred"].empty:
         print("[WARN] FRED unavailable - macro tilt disabled this run.")
 
