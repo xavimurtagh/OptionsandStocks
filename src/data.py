@@ -182,6 +182,7 @@ def load_fred(series: dict[str, str], start: str, end: str | None = None,
 
 
 _COT_URL = "https://www.cftc.gov/files/dea/history/fut_disagg_txt_{year}.zip"
+_COT_FIRST_YEAR = 2010   # disaggregated report not published before this
 
 
 def _cot_get(year: int):
@@ -247,7 +248,10 @@ def _fetch_cot_year(year: int) -> pd.DataFrame:
 
 
 def load_cot(cftc_codes: list[str], start: str, end: str | None = None) -> pd.DataFrame:
-    start_year = pd.Timestamp(start).year
+    # The CFTC disaggregated futures report only exists from 2010 on; earlier
+    # years 404. Clamp so extending the backtest to the GFC doesn't trigger a
+    # retry storm of 404s for data that was never published.
+    start_year = max(pd.Timestamp(start).year, _COT_FIRST_YEAR)
     end_year = pd.Timestamp(end or pd.Timestamp.today()).year
     frames = []
     for y in range(start_year, end_year + 1):

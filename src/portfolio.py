@@ -221,13 +221,17 @@ def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
     port_ret = (weights.shift(1) * rets).sum(axis=1)
 
     cost = pd.Series(0.0, index=rets.index)
+    turnover = pd.Series(0.0, index=rets.index)
     for t in tickers:
         turn = weights[t].diff().abs().fillna(weights[t].abs())
+        turnover = turnover + turn
         cost = cost + turnover_cost(turn, t, cfg)
 
     out = pd.DataFrame(index=rets.index)
     out["pnl"] = port_ret - cost
     out["gross"] = weights.abs().sum(axis=1)
+    out["turnover"] = turnover
+    out["cost"] = cost
     out["ew_bh"] = rets[tickers].mean(axis=1)               # equal-weight universe
     if "GLD" in rets.columns:
         out["gold_bh"] = rets["GLD"]

@@ -94,6 +94,14 @@ def test_carry_disabled_without_fred():
     assert (z == 0).all().all()
 
 
+def test_backtest_reports_turnover_and_cost():
+    panel = assemble_panel(_synth_data(), _cfg())
+    bt = portfolio_backtest(panel, _cfg())
+    assert {"turnover", "cost"} <= set(bt.columns)   # consumed by scripts/validate.py
+    assert (bt["turnover"] >= -1e-9).all()
+    assert (bt["cost"] >= -1e-9).all()
+
+
 def test_carry_weight_changes_the_book():
     panel = assemble_panel(_synth_data(), _cfg())
     off = portfolio_backtest(panel, replace(_cfg(), carry_weight=0.0))
