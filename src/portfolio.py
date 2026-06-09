@@ -161,12 +161,33 @@ def assemble_panel(data: dict, cfg: RunConfig) -> dict:
             "carry": carry, "credit_z": credit_z, "tickers": tickers}
 
 
+def _mom_crash_scale(mom: pd.DataFrame, panel: dict, cfg: RunConfig,
+                     window: int = 504, floor: float = 0.25) -> pd.Series:
+    """Vol-managed momentum (Barroso-Santa-Clara): momentum's own realized vol
+    spikes just before it crashes, so scale the sleeve down when its vol runs
+    above its 2y-trailing median. Self-calibrating (no magic target), trailing
+    only (no look-ahead), floored so it never fully switches momentum off."""
+    rets = panel["ret"]
+    rvol = _ewma_vol(rets, cfg.vol_span).clip(lower=0.02)
+    raw = (mom / rvol).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    mom_ret = (raw.shift(1) * rets).sum(axis=1)
+    mom_vol = mom_ret.ewm(span=63, min_periods=20).std() * np.sqrt(252)
+    # Reference = long-run typical momentum vol (expanding median, trailing). Using
+    # an expanding rather than rolling window means a sustained crisis doesn't pull
+    # the reference up with it, so the scale keeps cutting while vol stays elevated.
+    ref = mom_vol.expanding(min_periods=window // 2).median()
+    scale = (ref / mom_vol.replace(0, np.nan)).clip(lower=floor, upper=1.0)
+    return scale.reindex(mom.index).fillna(1.0)
+
+
 def combined_signal_panel(panel: dict, cfg: RunConfig) -> pd.DataFrame:
     w = cfg.signal_weights
-    sig = (w.get("tsmom", 0.0) * panel["tsmom"].fillna(0)
+    mom = (w.get("tsmom", 0.0) * panel["tsmom"].fillna(0)
            + w.get("xsmom", 0.0) * panel["xsmom"].fillna(0)
-           + w.get("value", 0.0) * panel["value"].fillna(0)
-           + cfg.macro_weight * panel["macro"].fillna(0))
+           + w.get("value", 0.0) * panel["value"].fillna(0))
+    if getattr(cfg, "mom_vol_managed", False):
+        mom = mom.mul(_mom_crash_scale(mom, panel, cfg), axis=0)
+    sig = mom + cfg.macro_weight * panel["macro"].fillna(0)
     carry = panel.get("carry")
     if cfg.carry_weight and carry is not None and not carry.empty:
         sig = sig + cfg.carry_weight * carry.reindex(
@@ -271,16 +292,18 @@ def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Knob sweep with multiple-testing controls (DSR corrected for #configs, PBO). #
 # --------------------------------------------------------------------------- #
-# long_only is fixed True (long/short has lost every sweep in this universe);
-# that freed dimension now A/Bs the credit risk-off overlay (rc) so DSR/PBO judge
-# it. Grid stays at 48 configs: weights(2) x tv(3) x macro(2) x carry(2) x rc(2).
+# long_only is fixed True (long/short has lost every sweep in this universe).
+# The credit overlay (rc) was provably inert here - every rc0/rc1 pair came out
+# identical - so that dimension now A/Bs vol-managed momentum (mvm), the fix for
+# the momentum whipsaw. Grid stays at 48: weights(2) x tv(3) x macro(2) x
+# carry(2) x mvm(2).
 DEFAULT_PORT_GRID = {
     "weights": {"xsmom": {"tsmom": 0.0, "xsmom": 1.0, "value": 0.0},
                 "blend": {"tsmom": 0.3, "xsmom": 0.7, "value": 0.0}},
     "portfolio_target_vol": [0.10, 0.15, 0.20],
     "macro_weight": [0.0, 0.3],
     "carry_weight": [0.0, 0.3],
-    "regime_credit": [False, True],
+    "mom_vol_managed": [False, True],
 }
 
 
@@ -290,14 +313,14 @@ def expand_port_grid(base: RunConfig, grid: dict) -> list[tuple[str, RunConfig]]
         for tv in grid["portfolio_target_vol"]:
             for mw in grid["macro_weight"]:
                 for cw in grid.get("carry_weight", [0.0]):
-                    for rc in grid.get("regime_credit", [False]):
+                    for mvm in grid.get("mom_vol_managed", [False]):
                         cfg = replace(base, signal_weights=dict(wv),
                                       long_only=True, portfolio_target_vol=tv,
                                       macro_weight=mw, carry_weight=cw,
-                                      regime_filter=True, regime_credit=rc)
+                                      regime_filter=True, mom_vol_managed=mvm)
                         out.append(
                             (f"{wn}|tv{tv:g}|mw{mw:g}|cw{cw:g}"
-                             f"|rc{int(rc)}", cfg))
+                             f"|mvm{int(mvm)}", cfg))
     return out
 
 

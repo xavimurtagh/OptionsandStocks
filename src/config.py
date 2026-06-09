@@ -92,6 +92,8 @@ class RunConfig:
     #                                     (per asset) - kills tiny vol-target wiggle.
     macro_weight: float = 0.0           # weight on the real-yield macro signal
     carry_weight: float = 0.0           # weight on the cross-asset carry signal
+    mom_vol_managed: bool = False       # scale momentum down when its own vol spikes
+    #                                     (Barroso-Santa-Clara momentum-crash control)
     regime_filter: bool = False         # cut gross when SPY < 200d trend
     regime_credit: bool = False         # also cut gross when HY credit spreads blow out
     regime_floor: float = 0.3           # min gross multiplier when risk-off

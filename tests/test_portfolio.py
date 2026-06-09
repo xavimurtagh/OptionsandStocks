@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from src.config import RunConfig
+import src.portfolio as portfolio
 from src.portfolio import (DEFAULT_PORT_GRID, MACRO_RY_BETA, _target_weights,
                            assemble_panel, carry_signal_panel,
                            combined_signal_panel, expand_port_grid,
@@ -192,14 +193,28 @@ def test_higher_target_vol_levers_up():
 
 def test_expand_port_grid_distinct_and_nonmutating():
     cfgs = expand_port_grid(_cfg(), DEFAULT_PORT_GRID)
-    assert len(cfgs) == 2 * 3 * 2 * 2 * 2  # weights x tv x macro x carry x credit
+    assert len(cfgs) == 2 * 3 * 2 * 2 * 2  # weights x tv x macro x carry x mvm
     names = [n for n, _ in cfgs]
     assert len(set(names)) == len(names)
-    # The grid fixes long-only and regime-on; only the credit overlay varies.
+    # The grid fixes long-only and regime-on; vol-managed momentum is the A/B.
     assert all(c.long_only and c.regime_filter for _, c in cfgs)
-    assert {c.regime_credit for _, c in cfgs} == {True, False}
+    assert {c.mom_vol_managed for _, c in cfgs} == {True, False}
     assert RunConfig().signal_weights == {"tsmom": 0.3, "xsmom": 0.7, "value": 0.0}
-    assert RunConfig().regime_credit is False  # base config untouched by the sweep
+    assert RunConfig().mom_vol_managed is False  # base config untouched by sweep
+
+
+def test_vol_managed_momentum_scales_down_and_is_optional():
+    panel = assemble_panel(_synth_data(), _cfg())
+    off = combined_signal_panel(panel, replace(_cfg(), mom_vol_managed=False))
+    on = combined_signal_panel(panel, replace(_cfg(), mom_vol_managed=True))
+    assert not off.equals(on)                       # the knob changes the book
+    # It only ever scales momentum DOWN, so |managed momentum| <= |raw momentum|.
+    w = _cfg().signal_weights
+    mom = (w["tsmom"] * panel["tsmom"].fillna(0)
+           + w["xsmom"] * panel["xsmom"].fillna(0)).abs()
+    scale = portfolio._mom_crash_scale(mom, panel, _cfg())
+    assert (scale <= 1.0 + 1e-9).all() and (scale >= 0.25 - 1e-9).all()
+    assert scale.min() < 1.0                        # it actually bites somewhere
 
 
 def test_portfolio_sweep_smoke():

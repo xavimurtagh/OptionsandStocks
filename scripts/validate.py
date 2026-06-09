@@ -78,6 +78,8 @@ def main(argv: list[str]) -> None:
         cfg.universe = [u for u in cfg.universe if u not in drop.split(",")]
     if "--regime-credit" in argv:
         cfg.regime_credit = True
+    if "--momvol" in argv:
+        cfg.mom_vol_managed = True
     fresh = "--fresh" in argv
 
     full = {n: ASSETS[n] for n in cfg.universe}

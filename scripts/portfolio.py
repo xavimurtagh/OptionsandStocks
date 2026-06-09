@@ -52,6 +52,8 @@ def main(argv: list[str]) -> None:
         cfg.macro_weight = 0.3
     if "--carry" in argv:
         cfg.carry_weight = 0.3
+    if "--momvol" in argv:
+        cfg.mom_vol_managed = True
     if "--regime" in argv:
         cfg.regime_filter = True
     if "--regime-credit" in argv:            # credit risk-off overlay (implies regime)
