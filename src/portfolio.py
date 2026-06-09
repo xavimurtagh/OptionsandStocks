@@ -293,17 +293,18 @@ def portfolio_backtest(panel: dict, cfg: RunConfig) -> pd.DataFrame:
 # Knob sweep with multiple-testing controls (DSR corrected for #configs, PBO). #
 # --------------------------------------------------------------------------- #
 # long_only is fixed True (long/short has lost every sweep in this universe).
-# The credit overlay (rc) was provably inert here - every rc0/rc1 pair came out
-# identical - so that dimension now A/Bs vol-managed momentum (mvm), the fix for
-# the momentum whipsaw. Grid stays at 48: weights(2) x tv(3) x macro(2) x
-# carry(2) x mvm(2).
+# The 5th grid dimension is gone on purpose: the credit overlay (rc) was provably
+# inert (identical rc0/rc1 pairs, which deflated PBO) and vol-managed momentum
+# (mvm) was a wash - neither earned its place, and carrying dead knobs only
+# inflates the multiple-testing penalty. The grid now tests only the choices that
+# matter: weights(2) x tv(3) x macro(2) x carry(2) = 24. (mvm/rc remain available
+# as flags for ad-hoc testing.)
 DEFAULT_PORT_GRID = {
     "weights": {"xsmom": {"tsmom": 0.0, "xsmom": 1.0, "value": 0.0},
                 "blend": {"tsmom": 0.3, "xsmom": 0.7, "value": 0.0}},
     "portfolio_target_vol": [0.10, 0.15, 0.20],
     "macro_weight": [0.0, 0.3],
     "carry_weight": [0.0, 0.3],
-    "mom_vol_managed": [False, True],
 }
 
 
@@ -313,14 +314,10 @@ def expand_port_grid(base: RunConfig, grid: dict) -> list[tuple[str, RunConfig]]
         for tv in grid["portfolio_target_vol"]:
             for mw in grid["macro_weight"]:
                 for cw in grid.get("carry_weight", [0.0]):
-                    for mvm in grid.get("mom_vol_managed", [False]):
-                        cfg = replace(base, signal_weights=dict(wv),
-                                      long_only=True, portfolio_target_vol=tv,
-                                      macro_weight=mw, carry_weight=cw,
-                                      regime_filter=True, mom_vol_managed=mvm)
-                        out.append(
-                            (f"{wn}|tv{tv:g}|mw{mw:g}|cw{cw:g}"
-                             f"|mvm{int(mvm)}", cfg))
+                    cfg = replace(base, signal_weights=dict(wv), long_only=True,
+                                  portfolio_target_vol=tv, macro_weight=mw,
+                                  carry_weight=cw, regime_filter=True)
+                    out.append((f"{wn}|tv{tv:g}|mw{mw:g}|cw{cw:g}", cfg))
     return out
 
 
