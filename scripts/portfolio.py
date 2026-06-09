@@ -45,6 +45,9 @@ def main(argv: list[str]) -> None:
     cfg.rebalance_days = int(_flag(argv, "--rebal", cfg.rebalance_days))
     cfg.no_trade_band = float(_flag(argv, "--band", cfg.no_trade_band))
     cfg.max_gross_leverage = float(_flag(argv, "--maxlev", cfg.max_gross_leverage))
+    drop = _flag(argv, "--drop", "")     # e.g. --drop oil,natgas,broad
+    if drop:
+        cfg.universe = [u for u in cfg.universe if u not in drop.split(",")]
     if "--macro" in argv:
         cfg.macro_weight = 0.3
     if "--carry" in argv:

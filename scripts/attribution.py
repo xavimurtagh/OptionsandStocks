@@ -51,6 +51,9 @@ def _champion(argv) -> RunConfig:
     cfg.start = _flag(argv, "--start", cfg.start)
     cfg.portfolio_target_vol = float(_flag(argv, "--tv", 0.15))
     cfg.rebalance_days = int(_flag(argv, "--rebal", 5))
+    drop = _flag(argv, "--drop", "")
+    if drop:
+        cfg.universe = [u for u in cfg.universe if u not in drop.split(",")]
     return cfg
 
 

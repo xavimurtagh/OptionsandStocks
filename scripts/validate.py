@@ -73,6 +73,9 @@ def main(argv: list[str]) -> None:
     cfg.portfolio_target_vol = float(_flag(argv, "--tv", cfg.portfolio_target_vol))
     cfg.rebalance_days = int(_flag(argv, "--rebal", cfg.rebalance_days))
     cfg.no_trade_band = float(_flag(argv, "--band", cfg.no_trade_band))
+    drop = _flag(argv, "--drop", "")     # e.g. --drop oil,natgas,broad
+    if drop:
+        cfg.universe = [u for u in cfg.universe if u not in drop.split(",")]
     if "--regime-credit" in argv:
         cfg.regime_credit = True
     fresh = "--fresh" in argv
