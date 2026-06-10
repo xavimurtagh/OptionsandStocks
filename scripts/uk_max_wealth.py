@@ -44,8 +44,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import ART_DIR, RunConfig
 from src.data import load_prices
 from src.research import series_stats
-from src.uk import (rotation_backtest, synth_leveraged_returns,
-                    tracking_report, trend_state)
+from src.uk import (blended_leverage_backtest, rotation_backtest,
+                    synth_leveraged_returns, tracking_report, trend_state,
+                    vol_target_leverage)
 
 # Regimes chosen a priori. 2000-02 is the reason this script exists: any
 # leveraged-Nasdaq idea that can't show you the dot-com bust is selling you
@@ -136,6 +137,16 @@ def main(argv: list[str]) -> None:
 
     bts = {"Q1x-tr": rot(rq, "q1"), "Q2x-tr": rot(q2, "q2"),
            "Q3x-tr": rot(q3, "q3"), "Q3x-au": rot(q3, "q3", gold, "gold")}
+
+    # Vol-targeted leverage (1x-levmax): the fix for the constant-3x death
+    # spiral. Scale leverage to a target vol while trend-on; gold when off.
+    vtarget = float(_flag(argv, "--vtarget", 0.30))
+    levmax = float(_flag(argv, "--levmax", 3.0))
+    lev = vol_target_leverage(qqq, state, target_vol=vtarget, lev_max=levmax)
+    bts["Qv-au"] = blended_leverage_backtest(
+        rq, q3, gold, lev, lag=lag, cost_3x=COST["q3"] + slip,
+        cost_1x=COST["q1"] + (slip if slip else 0.0), cost_safe=COST["gold"])
+
     pnls = {"SPY-bh": rs, "QQQ-bh": rq}
     pnls.update({k: b["pnl"] for k, b in bts.items()})
     pnls["50/50"] = 0.5 * rs.reindex(rq.index).fillna(0) + 0.5 * bts["Q3x-tr"]["pnl"]
@@ -147,7 +158,8 @@ def main(argv: list[str]) -> None:
     names = list(pnls)
     yrs = len(live) / 252.0
     print(f"\nBacktest {live[0].date()} -> {live[-1].date()}  ({yrs:.1f} years)"
-          f"   MA{ma}, exit band {band:g}, confirm {confirm}d, lag {lag} closes")
+          f"   MA{ma}, exit band {band:g}, confirm {confirm}d, lag {lag} closes"
+          f"   Qv: target {vtarget:.0%} vol, max {levmax:g}x")
 
     # ---- Regime grid: CAGR per regime per variant -------------------------
     print(f"\n{'regime':<16}" + "".join(f"{n:>9}" for n in names))
@@ -184,16 +196,26 @@ def main(argv: list[str]) -> None:
           f"DSR {dsr:.2f} (deflated for {len(strat_only)} variants tried)")
 
     # ---- What does being slow cost? Champion CAGR at lag 1/2/3 ------------
+    # A 200d trend filter is the opposite of latency-sensitive: if more lag
+    # doesn't hurt (or helps), the fast-money/HFT worry doesn't apply here.
     leg = {"Q1x-tr": ("q1", rq), "Q2x-tr": ("q2", q2),
            "Q3x-tr": ("q3", q3), "Q3x-au": ("q3", q3)}.get(champ)
-    if leg:
-        cags = []
-        for L in (1, 2, 3):
+    cags = []
+    for L in (1, 2, 3):
+        if champ == "Qv-au":
+            b = blended_leverage_backtest(rq, q3, gold, lev, lag=L,
+                                          cost_3x=COST["q3"] + slip,
+                                          cost_1x=COST["q1"], cost_safe=COST["gold"])
+        elif leg:
             safe = gold if champ == "Q3x-au" else rf_daily
             b = rotation_backtest(leg[1], safe, state, lag=L,
                                   cost_risk=COST[leg[0]] + slip,
                                   cost_safe=COST["gold" if champ == "Q3x-au" else "cash"])
-            cags.append(series_stats(b["pnl"].reindex(live).fillna(0))["cagr"])
+        else:
+            cags = []
+            break
+        cags.append(series_stats(b["pnl"].reindex(live).fillna(0))["cagr"])
+    if cags:
         print(f"Lag sensitivity ({champ}):  same-close {cags[0]:+.1%}   "
               f"next-close {cags[1]:+.1%}   two-late {cags[2]:+.1%}"
               f"   (cost of being a day slower: {(cags[0] - cags[1]) * 100:.1f}pp/yr)")

@@ -91,11 +91,70 @@ def rotation_backtest(risk_ret: pd.Series, safe_ret: pd.Series,
     cost_*: one-way cost per unit notional for each leg (half-spread + FX +
     slippage). A switch trades both legs, so it costs cost_risk + cost_safe.
     """
-    pos = state.shift(lag).fillna(False).astype(float)
+    pos = state.shift(lag, fill_value=False).astype(float)
     turn = pos.diff().abs().fillna(0.0)
     cost = turn * (cost_risk + cost_safe)
     pnl = pos * risk_ret.fillna(0.0) + (1 - pos) * safe_ret.fillna(0.0) - cost
     return pd.DataFrame({"pnl": pnl, "pos": pos, "switch": turn, "cost": cost})
+
+
+def vol_target_leverage(close: pd.Series, state: pd.Series,
+                        target_vol: float = 0.30, lev_min: float = 1.0,
+                        lev_max: float = 3.0, span: int = 40) -> pd.Series:
+    """Effective leverage to run while trend-on: clip(target_vol / realized_vol)
+    in [lev_min, lev_max], and 0 when trend-off.
+
+    Constant 3x dies in the 2000-02 / 2008 whipsaws because realized vol there
+    is ~40-60% and daily-reset decay scales with vol^2 - you keep the most
+    leverage exactly when it's most toxic. Targeting a volatility instead means
+    full leverage only in the calm uptrends where the daily reset compounds for
+    you, and ~1x when the index is thrashing even if still above its MA.
+    Trailing EWMA vol, so no look-ahead."""
+    ret = close.pct_change()
+    vol = ret.ewm(span=span, min_periods=max(span // 2, 10)).std() * np.sqrt(252)
+    lev = (target_vol / vol.replace(0.0, np.nan)).clip(lower=lev_min, upper=lev_max)
+    return lev.fillna(lev_min).where(state.astype(bool), 0.0)
+
+
+def blended_leverage_backtest(idx_ret: pd.Series, r3x: pd.Series,
+                              safe_ret: pd.Series, lev_target: pd.Series,
+                              lag: int = 2, band: float = 0.10,
+                              cost_3x: float = 0.0027, cost_1x: float = 0.0007,
+                              cost_safe: float = 0.0) -> pd.DataFrame:
+    """Hit a continuous effective leverage with a tradeable 1x/3x ETP blend.
+
+    A single 3x ETP can't express 1.7x; a held mix of a 1x fund (EQQQ) and a 3x
+    fund (QQQ3) can: lev = 3*w3 + 1*(1-w3) over the invested sleeve, so
+    w3 = (lev-1)/2. Off-trend -> all safe. The blend also has *less* decay than
+    a pure 2x ETP because the 1x portion doesn't reset. A no-trade band on
+    leverage (in leverage units) keeps the daily vol signal from churning the
+    book - you only re-blend when target leverage has moved materially.
+    """
+    lev = lev_target.to_numpy(float).copy()
+    if band > 0:                                   # band in units of leverage
+        held = lev[0]
+        for i in range(1, len(lev)):
+            if abs(lev[i] - held) > band or (lev[i] == 0) != (held == 0):
+                held = lev[i]
+            lev[i] = held
+    lev = pd.Series(lev, index=lev_target.index)
+    on = lev > 0
+    w3 = ((lev - 1.0) / 2.0).clip(lower=0.0, upper=1.0).where(on, 0.0)
+    w1 = (1.0 - w3).where(on, 0.0)
+    wsafe = 1.0 - w3 - w1
+
+    def lagged(s):
+        return s.shift(lag).fillna(0.0)
+
+    w3l, w1l, wsl = lagged(w3), lagged(w1), lagged(wsafe)
+    cost = (w3l.diff().abs().fillna(w3l.abs()) * cost_3x
+            + w1l.diff().abs().fillna(w1l.abs()) * cost_1x
+            + wsl.diff().abs().fillna(0.0) * cost_safe)
+    pnl = (w3l * r3x.fillna(0.0) + w1l * idx_ret.fillna(0.0)
+           + wsl * safe_ret.fillna(0.0) - cost)
+    return pd.DataFrame({"pnl": pnl, "lev": lev, "w3": w3,
+                         "switch": w3l.diff().abs().fillna(0.0)
+                         + w1l.diff().abs().fillna(0.0), "cost": cost})
 
 
 def tracking_report(synth: pd.Series, real: pd.Series) -> dict | None:

@@ -2,7 +2,8 @@
 import numpy as np
 import pandas as pd
 
-from src.uk import rotation_backtest, synth_leveraged_returns, trend_state
+from src.uk import (blended_leverage_backtest, rotation_backtest,
+                    synth_leveraged_returns, trend_state, vol_target_leverage)
 
 
 def _idx(n, start="2015-01-01"):
@@ -70,3 +71,48 @@ def test_rotation_lag_and_costs():
     assert bt["cost"].drop(idx[5]).sum() == 0
     assert np.isclose(bt["pnl"].iloc[5], 0.10 - 0.003)
     assert np.isclose(bt["pnl"].iloc[4], 0.0)    # day before fill: still safe
+
+
+def test_vol_target_leverage_inverse_to_vol_and_gated():
+    idx = _idx(400)
+    # First half calm, second half wild: leverage should fall when vol rises.
+    calm = np.full(200, 0.003)
+    wild = np.array([0.05, -0.05] * 100)
+    close = pd.Series(100 * np.exp(np.cumsum(np.concatenate([calm, wild]))), index=idx)
+    state = pd.Series(True, index=idx)
+    lev = vol_target_leverage(close, state, target_vol=0.30, lev_min=1.0,
+                              lev_max=3.0, span=20)
+    assert lev.iloc[150] > lev.iloc[-1]                 # calm levers up, wild down
+    assert (lev >= 1.0).all() and (lev <= 3.0).all()    # respects the clip
+    # Trend-off forces zero leverage regardless of vol.
+    off = pd.Series([True] * 200 + [False] * 200, index=idx)
+    assert (vol_target_leverage(close, off, span=20).iloc[200:] == 0).all()
+
+
+def test_blended_leverage_maps_to_etp_mix_no_lookahead():
+    idx = _idx(12)
+    ridx = pd.Series(0.01, index=idx)        # 1x index leg
+    r3 = pd.Series(0.03, index=idx)          # 3x ETP leg
+    safe = pd.Series(0.0, index=idx)
+    # lev=1 -> all in the 1x leg (w3=0); lev=3 -> all in the 3x leg (w3=1).
+    lev1 = pd.Series(1.0, index=idx)
+    b1 = blended_leverage_backtest(ridx, r3, safe, lev1, lag=2, band=0.0,
+                                   cost_3x=0.003, cost_1x=0.001)
+    assert np.isclose(b1["w3"].iloc[-1], 0.0)
+    assert np.isclose(b1["pnl"].iloc[-1], 0.01)         # earns the 1x leg, no 3x cost
+    lev3 = pd.Series(3.0, index=idx)
+    b3 = blended_leverage_backtest(ridx, r3, safe, lev3, lag=2, band=0.0,
+                                   cost_3x=0.003, cost_1x=0.001)
+    assert np.isclose(b3["w3"].iloc[-1], 1.0)
+    assert np.isclose(b3["pnl"].iloc[-1], 0.03)         # earns the 3x leg
+    assert (b3["pnl"].iloc[:2] == 0).all()              # lag: nothing earned yet
+
+
+def test_blended_leverage_band_cuts_turnover():
+    idx = _idx(300)
+    rng = np.random.default_rng(3)
+    lev = pd.Series(2.0 + rng.normal(0, 0.3, 300), index=idx).clip(1, 3)
+    r = pd.Series(0.0, index=idx)
+    busy = blended_leverage_backtest(r, r, r, lev, band=0.0)
+    calm = blended_leverage_backtest(r, r, r, lev, band=0.25)
+    assert calm["switch"].sum() < busy["switch"].sum()
