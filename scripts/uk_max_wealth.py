@@ -46,7 +46,7 @@ from src.data import load_prices
 from src.research import series_stats
 from src.uk import (blended_leverage_backtest, rotation_backtest,
                     synth_leveraged_returns, tracking_report, trend_state,
-                    vol_target_leverage)
+                    vol_gate_leverage, vol_target_leverage)
 
 # Regimes chosen a priori. 2000-02 is the reason this script exists: any
 # leveraged-Nasdaq idea that can't show you the dot-com bust is selling you
@@ -147,6 +147,17 @@ def main(argv: list[str]) -> None:
         rq, q3, gold, lev, lag=lag, cost_3x=COST["q3"] + slip,
         cost_1x=COST["q1"] + (slip if slip else 0.0), cost_safe=COST["gold"])
 
+    # Binary vol gate with hysteresis: Qv's real-data audit showed continuous
+    # vol scaling anti-times choppy years (0%/yr in 2003-07 vs +8-9%/yr for
+    # its own legs) and churns. The gate never trades mid-swing: 3x in calm
+    # uptrends, 1x in loud ones, out (gold) off-trend.
+    vlo = float(_flag(argv, "--vlo", 0.20))
+    vhi = float(_flag(argv, "--vhi", 0.28))
+    glev = vol_gate_leverage(qqq, state, lo=vlo, hi=vhi, lev_hi=levmax)
+    bts["Qg-au"] = blended_leverage_backtest(
+        rq, q3, gold, glev, lag=lag, cost_3x=COST["q3"] + slip,
+        cost_1x=COST["q1"] + (slip if slip else 0.0), cost_safe=COST["gold"])
+
     pnls = {"SPY-bh": rs, "QQQ-bh": rq}
     pnls.update({k: b["pnl"] for k, b in bts.items()})
     pnls["50/50"] = 0.5 * rs.reindex(rq.index).fillna(0) + 0.5 * bts["Q3x-tr"]["pnl"]
@@ -159,7 +170,7 @@ def main(argv: list[str]) -> None:
     yrs = len(live) / 252.0
     print(f"\nBacktest {live[0].date()} -> {live[-1].date()}  ({yrs:.1f} years)"
           f"   MA{ma}, exit band {band:g}, confirm {confirm}d, lag {lag} closes"
-          f"   Qv: target {vtarget:.0%} vol, max {levmax:g}x")
+          f"   Qv: target {vtarget:.0%}, max {levmax:g}x   Qg: gate {vlo:.0%}/{vhi:.0%}")
 
     # ---- Regime grid: CAGR per regime per variant -------------------------
     print(f"\n{'regime':<16}" + "".join(f"{n:>9}" for n in names))
@@ -202,9 +213,10 @@ def main(argv: list[str]) -> None:
            "Q3x-tr": ("q3", q3), "Q3x-au": ("q3", q3)}.get(champ)
     cags = []
     for L in (1, 2, 3):
-        if champ == "Qv-au":
-            b = blended_leverage_backtest(rq, q3, gold, lev, lag=L,
-                                          cost_3x=COST["q3"] + slip,
+        if champ in ("Qv-au", "Qg-au"):
+            b = blended_leverage_backtest(rq, q3, gold,
+                                          lev if champ == "Qv-au" else glev,
+                                          lag=L, cost_3x=COST["q3"] + slip,
                                           cost_1x=COST["q1"], cost_safe=COST["gold"])
         elif leg:
             safe = gold if champ == "Q3x-au" else rf_daily

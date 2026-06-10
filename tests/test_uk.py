@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 
 from src.uk import (blended_leverage_backtest, rotation_backtest,
-                    synth_leveraged_returns, trend_state, vol_target_leverage)
+                    synth_leveraged_returns, trend_state, vol_gate_leverage,
+                    vol_target_leverage)
 
 
 def _idx(n, start="2015-01-01"):
@@ -106,6 +107,35 @@ def test_blended_leverage_maps_to_etp_mix_no_lookahead():
     assert np.isclose(b3["w3"].iloc[-1], 1.0)
     assert np.isclose(b3["pnl"].iloc[-1], 0.03)         # earns the 3x leg
     assert (b3["pnl"].iloc[:2] == 0).all()              # lag: nothing earned yet
+
+
+def test_vol_gate_hysteresis_and_gating():
+    idx = _idx(600)
+    # calm (sig 0.005 ~ 8% ann) -> wild (0.04 ~ 63%) -> mid (0.015 ~ 24%):
+    # the mid stretch sits inside the 20%/28% band, so the gate must HOLD the
+    # loud state from the wild stretch rather than flip back to 3x.
+    rets = np.concatenate([np.full(200, 0.005), np.full(200, 0.04),
+                           np.full(200, 0.015)] ) * np.tile([1, -1], 300)
+    close = pd.Series(100 * np.exp(np.cumsum(rets)), index=idx)
+    state = pd.Series(True, index=idx)
+    lev = vol_gate_leverage(close, state, lo=0.20, hi=0.28, span=20)
+    assert lev.iloc[150] == 3.0          # calm: full leverage
+    assert lev.iloc[350] == 1.0          # wild: stepped down
+    assert lev.iloc[-1] == 1.0           # in-band: holds prior (loud) state
+    # trend-off forces 0 regardless of calm
+    off = pd.Series(False, index=idx)
+    assert (vol_gate_leverage(close, off, span=20) == 0.0).all()
+
+
+def test_vol_gate_no_lookahead():
+    rng = np.random.default_rng(11)
+    close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0.0004, 0.013, 700))),
+                      index=_idx(700))
+    state = pd.Series(True, index=close.index)
+    full = vol_gate_leverage(close, state, span=40)
+    cut = 480
+    prefix = vol_gate_leverage(close.iloc[:cut], state.iloc[:cut], span=40)
+    assert (full.iloc[:cut] == prefix).all()
 
 
 def test_blended_leverage_band_cuts_turnover():

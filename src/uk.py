@@ -157,6 +157,38 @@ def blended_leverage_backtest(idx_ret: pd.Series, r3x: pd.Series,
                          + w1l.diff().abs().fillna(0.0), "cost": cost})
 
 
+def vol_gate_leverage(close: pd.Series, state: pd.Series,
+                      lo: float = 0.20, hi: float = 0.28, span: int = 40,
+                      lev_hi: float = 3.0, lev_lo: float = 1.0) -> pd.Series:
+    """Binary leverage regime: lev_hi when trend-on AND vol is calm, lev_lo
+    when trend-on but loud, 0 when trend-off.
+
+    The continuous version (vol_target_leverage) failed its real-data audit:
+    in 2003-07 it returned ~0%/yr while both of its legs made +8-9%/yr,
+    because clip(target/ewma_vol) re-levers at the top of every calm rally and
+    de-levers after every dip - pro-cyclical at exactly the swing frequency,
+    plus constant re-blending costs. The fix is to never trade mid-swing:
+    a binary gate with a wide hysteresis band (calm when vol < lo, loud only
+    when vol > hi, hold in between) flips a few times a year at most, holds
+    full leverage through low-vol uptrends, and steps aside to lev_lo for
+    high-vol whipsaw regimes like 2000-02 where daily-reset leverage bleeds.
+    Trailing EWMA vol only - the gate on day t uses data through close t."""
+    ret = close.pct_change()
+    vol = (ret.ewm(span=span, min_periods=max(span // 2, 10)).std()
+           * np.sqrt(252)).to_numpy(float)
+    calm = np.zeros(len(vol), dtype=bool)
+    cur = False
+    for i in range(len(vol)):
+        if not np.isnan(vol[i]):
+            if vol[i] < lo:
+                cur = True
+            elif vol[i] > hi:
+                cur = False
+        calm[i] = cur
+    lev = np.where(calm, lev_hi, lev_lo)
+    return pd.Series(lev, index=close.index).where(state.astype(bool), 0.0)
+
+
 def tracking_report(synth: pd.Series, real: pd.Series) -> dict | None:
     """How well does the synthetic ETP replicate a real one over the overlap?
     Weekly compounding absorbs the LSE-vs-NYSE close-time mismatch that makes
