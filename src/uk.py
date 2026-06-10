@@ -1,0 +1,114 @@
+"""UK-retail max-wealth engine: trend-gated leveraged-ETP rotation.
+
+Goal (b) of the deployment study: maximize long-run CAGR under what a UK
+retail investor can actually trade (Trading212 ISA: 1x cash account, no
+margin, UCITS funds + LSE-listed leveraged ETPs only). At 1x, the
+diversified vol-targeted book cannot out-return an index, so the only
+honest leverage channel is daily-reset leveraged ETPs (e.g. WisdomTree
+QQQ3). Held naked those die in crashes; gated by a long-term trend filter
+("Leverage for the Long Run", Gayed & Bilello 2016) they hold leverage
+only in the calm-uptrend regime where daily resets compound in your favor.
+
+Everything here is pure logic on price series - no network - so it is unit
+testable. The deployment script (scripts/uk_max_wealth.py) wires in data.
+
+Honesty constraints baked in rather than bolted on:
+  * Synthetic ETP returns charge real financing: (L-1) x (T-bill + spread)
+    plus TER, daily. Validated against actual ETPs (TQQQ, QQQ3.L) where
+    histories overlap.
+  * Execution lag >= 2 closes: the signal is computed on close t, the fill
+    happens at close t+1, so the strategy earns the new position only from
+    t+2. Faster players move the price first; we pay that gap, never earn it.
+  * Hysteresis + confirmation on the trend state: each whipsaw costs
+    spread + FX both ways, so the state machine needs to be expensive to flip.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def synth_leveraged_returns(idx_ret: pd.Series, rf_ann: pd.Series | float,
+                            leverage: float, ter: float = 0.0075,
+                            borrow_spread: float = 0.006) -> pd.Series:
+    """Daily-reset L x ETP returns from index returns + financing.
+
+    r_etp = L * r_idx - [(L-1) * (rf + spread) + TER] / 252
+
+    The (L-1) notional is borrowed at the short rate plus a swap spread; the
+    TER is the fund fee. This is the standard replication of how leveraged
+    ETPs are actually built (total-return swaps reset daily), so volatility
+    decay emerges from the compounding itself rather than being assumed.
+    """
+    if isinstance(rf_ann, pd.Series):
+        rf = rf_ann.reindex(idx_ret.index).ffill().fillna(0.02)
+    else:
+        rf = pd.Series(float(rf_ann), index=idx_ret.index)
+    drag = ((leverage - 1.0) * (rf + borrow_spread) + ter) / 252.0
+    return (leverage * idx_ret - drag).clip(lower=-0.99)
+
+
+def trend_state(close: pd.Series, window: int = 200, exit_band: float = 0.99,
+                confirm: int = 2) -> pd.Series:
+    """Risk-on/off state from a long-term moving average, built to be
+    expensive to flip: enter when close > MA for `confirm` consecutive days,
+    exit only when close < MA * exit_band for `confirm` consecutive days.
+    The asymmetric band + confirmation kill most one-day whipsaws, which at
+    3x leverage each cost a round trip of spread + FX. Trailing-only: the
+    state on day t uses data through close t."""
+    ma = close.rolling(window, min_periods=window).mean()
+    c, m = close.to_numpy(float), ma.to_numpy(float)
+    above = c > m                      # NaN MA compares False -> stays out
+    below = c < m * exit_band
+    state = np.zeros(len(c), dtype=bool)
+    cur, cnt_on, cnt_off = False, 0, 0
+    for i in range(len(c)):
+        if np.isnan(m[i]):
+            continue                   # warmup: out of the market
+        cnt_on = cnt_on + 1 if above[i] else 0
+        cnt_off = cnt_off + 1 if below[i] else 0
+        if not cur and cnt_on >= confirm:
+            cur = True
+        elif cur and cnt_off >= confirm:
+            cur = False
+        state[i] = cur
+    return pd.Series(state, index=close.index)
+
+
+def rotation_backtest(risk_ret: pd.Series, safe_ret: pd.Series,
+                      state: pd.Series, lag: int = 2,
+                      cost_risk: float = 0.0027, cost_safe: float = 0.0
+                      ) -> pd.DataFrame:
+    """Mark-to-market a binary rotation: 100% risk asset when state is on,
+    100% safe asset when off.
+
+    lag: closes between signal and the position earning returns. lag=2 is
+    the retail reality (signal at close t, fill at close t+1, new position
+    earns from t+2); lag=1 is the academic same-close fill kept only to
+    measure how much the one-day delay - the price impact of everyone
+    faster - costs.
+
+    cost_*: one-way cost per unit notional for each leg (half-spread + FX +
+    slippage). A switch trades both legs, so it costs cost_risk + cost_safe.
+    """
+    pos = state.shift(lag).fillna(False).astype(float)
+    turn = pos.diff().abs().fillna(0.0)
+    cost = turn * (cost_risk + cost_safe)
+    pnl = pos * risk_ret.fillna(0.0) + (1 - pos) * safe_ret.fillna(0.0) - cost
+    return pd.DataFrame({"pnl": pnl, "pos": pos, "switch": turn, "cost": cost})
+
+
+def tracking_report(synth: pd.Series, real: pd.Series) -> dict | None:
+    """How well does the synthetic ETP replicate a real one over the overlap?
+    Weekly compounding absorbs the LSE-vs-NYSE close-time mismatch that makes
+    daily correlations of cross-listed products look spuriously poor."""
+    both = pd.concat({"synth": synth, "real": real}, axis=1).dropna()
+    if len(both) < 250:
+        return None
+    wk = (1 + both).resample("W-FRI").prod() - 1
+    wk = wk[(wk != 0).any(axis=1)]
+    yrs = len(both) / 252.0
+    cagr = (1 + both).prod() ** (1 / yrs) - 1
+    return {"overlap_yrs": yrs, "weekly_corr": float(wk["synth"].corr(wk["real"])),
+            "cagr_synth": float(cagr["synth"]), "cagr_real": float(cagr["real"]),
+            "ann_diff": float(cagr["synth"] - cagr["real"])}
