@@ -222,6 +222,46 @@ def gated_leverage_sleeve(close: pd.Series, idx_ret: pd.Series,
                                      cost_safe=cost_safe, lev_high=lev_max)["pnl"]
 
 
+# LSE-listed, UCITS / ISA-eligible instruments the strategy actually trades.
+DEPLOY_TICKERS = {
+    "ndx_core": "EQQQ", "ndx_lev": "QQQ3", "spx_core": "CSPX",
+    "spx_lev": "3USL", "safe": "SGLN", "cash": "CASH",
+}
+
+
+def target_allocation(trend_ndx: bool, calm_ndx: bool, trend_spx: bool,
+                      calm_spx: bool, sat_weight: float,
+                      index_split: float = 0.5) -> dict[str, float]:
+    """Today's target book as instrument -> weight, summing to 1.0.
+
+    The deployable strategy is core (1-sat_weight) + satellite (sat_weight),
+    each split index_split across Nasdaq / S&P:
+      * core sleeve   : the 1x UCITS fund when its index is above its 200d
+                        trend, else cash.
+      * satellite     : the 3x ETP when trend-on AND vol-calm, the 1x fund when
+                        trend-on but vol-loud (gate stepped down), else the safe
+                        asset (gold) when trend-off.
+    Pure routing logic (no data), so the live signal script and the backtest can
+    never disagree about what a given state implies you hold."""
+    t = DEPLOY_TICKERS
+    a = {v: 0.0 for v in t.values()}
+    core_w = 1.0 - sat_weight
+    for trend, calm, w_idx, core_tk, lev_tk in (
+        (trend_ndx, calm_ndx, index_split, t["ndx_core"], t["ndx_lev"]),
+        (trend_spx, calm_spx, 1.0 - index_split, t["spx_core"], t["spx_lev"]),
+    ):
+        # core sleeve for this index
+        a[core_tk if trend else t["cash"]] += core_w * w_idx
+        # satellite sleeve for this index
+        if not trend:
+            a[t["safe"]] += sat_weight * w_idx
+        elif calm:
+            a[lev_tk] += sat_weight * w_idx
+        else:
+            a[core_tk] += sat_weight * w_idx
+    return a
+
+
 def tracking_report(synth: pd.Series, real: pd.Series) -> dict | None:
     """How well does the synthetic ETP replicate a real one over the overlap?
     Weekly compounding absorbs the LSE-vs-NYSE close-time mismatch that makes

@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 
 from src.uk import (blended_leverage_backtest, gated_leverage_sleeve,
-                    rotation_backtest, synth_leveraged_returns, trend_state,
-                    vol_gate_leverage, vol_target_leverage)
+                    rotation_backtest, synth_leveraged_returns, target_allocation,
+                    trend_state, vol_gate_leverage, vol_target_leverage)
 
 
 def _idx(n, start="2015-01-01"):
@@ -177,6 +177,28 @@ def test_gated_sleeve_runs_and_respects_lev_max():
     p3 = gated_leverage_sleeve(close, ret, 0.03, safe, lev_max=3.0)
     assert p2.std() < p3.std()
     assert len(p2) == len(close) and p2.notna().all()
+
+
+def test_target_allocation_routes_and_sums_to_one():
+    # Both indices trend-on and calm: satellite fully in the 3x ETPs, core in
+    # the 1x funds, nothing in gold or cash.
+    a = target_allocation(True, True, True, True, sat_weight=0.5)
+    assert abs(sum(a.values()) - 1.0) < 1e-12
+    assert a["QQQ3"] == 0.25 and a["3USL"] == 0.25      # 0.5 sat * 0.5 index
+    assert a["EQQQ"] == 0.25 and a["CSPX"] == 0.25      # 0.5 core * 0.5 index
+    assert a["SGLN"] == 0.0 and a["CASH"] == 0.0
+    # Trend-on but vol-loud: the satellite steps down into the 1x fund, not 3x.
+    b = target_allocation(True, False, True, False, sat_weight=0.5)
+    assert b["QQQ3"] == 0.0 and b["3USL"] == 0.0
+    assert b["EQQQ"] == 0.5 and b["CSPX"] == 0.5        # core + stepped-down sat
+    # Trend-off: core to cash, satellite to gold.
+    c = target_allocation(False, True, False, True, sat_weight=0.5)
+    assert abs(sum(c.values()) - 1.0) < 1e-12
+    assert c["CASH"] == 0.5 and c["SGLN"] == 0.5
+    # All-core (sat_weight 0) never touches the leveraged ETPs or gold.
+    d = target_allocation(True, True, False, False, sat_weight=0.0)
+    assert d["QQQ3"] == 0 and d["3USL"] == 0 and d["SGLN"] == 0
+    assert d["EQQQ"] == 0.5 and d["CASH"] == 0.5
 
 
 def test_blended_leverage_band_cuts_turnover():
