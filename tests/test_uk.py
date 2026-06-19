@@ -2,9 +2,9 @@
 import numpy as np
 import pandas as pd
 
-from src.uk import (blended_leverage_backtest, rotation_backtest,
-                    synth_leveraged_returns, trend_state, vol_gate_leverage,
-                    vol_target_leverage)
+from src.uk import (blended_leverage_backtest, gated_leverage_sleeve,
+                    rotation_backtest, synth_leveraged_returns, trend_state,
+                    vol_gate_leverage, vol_target_leverage)
 
 
 def _idx(n, start="2015-01-01"):
@@ -147,6 +147,36 @@ def test_vol_gate_no_lookahead():
     cut = 480
     prefix = vol_gate_leverage(close.iloc[:cut], state.iloc[:cut], span=40)
     assert (full.iloc[:cut] == prefix).all()
+
+
+def test_blended_leverage_high_leg_generalizes():
+    idx = _idx(12)
+    ridx = pd.Series(0.01, index=idx)
+    r2 = pd.Series(0.02, index=idx)          # a 2x ETP leg
+    safe = pd.Series(0.0, index=idx)
+    lev2 = pd.Series(2.0, index=idx)
+    # With lev_high=2, target leverage 2 must put the whole sleeve in the 2x leg.
+    b = blended_leverage_backtest(ridx, r2, safe, lev2, lag=2, band=0.0,
+                                  cost_3x=0.003, cost_1x=0.001, lev_high=2.0)
+    assert np.isclose(b["w3"].iloc[-1], 1.0)
+    assert np.isclose(b["pnl"].iloc[-1], 0.02)
+    # Default lev_high=3 is unchanged: lev 2 -> half in the high leg.
+    b3 = blended_leverage_backtest(ridx, r2, safe, lev2, lag=2, band=0.0)
+    assert np.isclose(b3["w3"].iloc[-1], 0.5)
+
+
+def test_gated_sleeve_runs_and_respects_lev_max():
+    rng = np.random.default_rng(5)
+    close = pd.Series(100 * np.exp(np.cumsum(rng.normal(0.0005, 0.012, 800))),
+                      index=_idx(800))
+    ret = close.pct_change()
+    safe = pd.Series(0.0, index=close.index)
+    # Higher lev_max should not lower the in-trend exposure: a 3x sleeve's
+    # realized vol exceeds a 2x sleeve's over the same path (sanity, not exact).
+    p2 = gated_leverage_sleeve(close, ret, 0.03, safe, lev_max=2.0)
+    p3 = gated_leverage_sleeve(close, ret, 0.03, safe, lev_max=3.0)
+    assert p2.std() < p3.std()
+    assert len(p2) == len(close) and p2.notna().all()
 
 
 def test_blended_leverage_band_cuts_turnover():

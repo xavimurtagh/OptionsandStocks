@@ -127,15 +127,17 @@ def blended_leverage_backtest(idx_ret: pd.Series, r3x: pd.Series,
                               safe_ret: pd.Series, lev_target: pd.Series,
                               lag: int = 2, band: float = 0.10,
                               cost_3x: float = 0.0027, cost_1x: float = 0.0007,
-                              cost_safe: float = 0.0) -> pd.DataFrame:
-    """Hit a continuous effective leverage with a tradeable 1x/3x ETP blend.
+                              cost_safe: float = 0.0,
+                              lev_high: float = 3.0) -> pd.DataFrame:
+    """Hit a continuous effective leverage with a tradeable 1x/high-x ETP blend.
 
-    A single 3x ETP can't express 1.7x; a held mix of a 1x fund (EQQQ) and a 3x
-    fund (QQQ3) can: lev = 3*w3 + 1*(1-w3) over the invested sleeve, so
-    w3 = (lev-1)/2. Off-trend -> all safe. The blend also has *less* decay than
-    a pure 2x ETP because the 1x portion doesn't reset. A no-trade band on
-    leverage (in leverage units) keeps the daily vol signal from churning the
-    book - you only re-blend when target leverage has moved materially.
+    A single 3x ETP can't express 1.7x; a held mix of a 1x fund (EQQQ) and a
+    high-x fund (QQQ3, lev_high=3) can: lev = lev_high*w_hi + 1*(1-w_hi) over
+    the invested sleeve, so w_hi = (lev-1)/(lev_high-1). r3x is whichever
+    leveraged ETP you're blending (pass a 2x series with lev_high=2 to size the
+    sleeve down for holdability). Off-trend -> all safe. The blend also has
+    *less* decay than the pure high-x ETP because the 1x portion doesn't reset.
+    A no-trade band on leverage keeps the daily vol signal from churning.
     """
     lev = lev_target.to_numpy(float).copy()
     if band > 0:                                   # band in units of leverage
@@ -146,7 +148,7 @@ def blended_leverage_backtest(idx_ret: pd.Series, r3x: pd.Series,
             lev[i] = held
     lev = pd.Series(lev, index=lev_target.index)
     on = lev > 0
-    w3 = ((lev - 1.0) / 2.0).clip(lower=0.0, upper=1.0).where(on, 0.0)
+    w3 = ((lev - 1.0) / (lev_high - 1.0)).clip(lower=0.0, upper=1.0).where(on, 0.0)
     w1 = (1.0 - w3).where(on, 0.0)
     wsafe = 1.0 - w3 - w1
 
@@ -194,6 +196,30 @@ def vol_gate_leverage(close: pd.Series, state: pd.Series,
         calm[i] = cur
     lev = np.where(calm, lev_hi, lev_lo)
     return pd.Series(lev, index=close.index).where(state.astype(bool), 0.0)
+
+
+def gated_leverage_sleeve(close: pd.Series, idx_ret: pd.Series,
+                          rf_ann: pd.Series | float, safe_ret: pd.Series,
+                          lev_max: float = 3.0, ma: int = 200,
+                          vlo: float = 0.20, vhi: float = 0.28, lag: int = 2,
+                          cost_hi: float = 0.0027, cost_1x: float = 0.0007,
+                          cost_safe: float = 0.0010,
+                          extra_drag: float = 0.0) -> pd.Series:
+    """One deployable trend-gated, vol-stepped leveraged sleeve -> daily pnl.
+
+    The unit that passed the cross-asset audit, packaged for reuse: a long-term
+    trend filter (ma) decides in/out, a vol gate decides lev_max vs 1x while in,
+    and safe_ret (gold or cash) is held when out. lev_max sizes the sleeve -
+    drop it to 2x to trade return for a holdable drawdown. extra_drag applies
+    the real-product tracking haircut. Composing two of these (e.g. Nasdaq +
+    S&P) diversifies the single-index regime risk that one sleeve carries.
+    """
+    leg = synth_leveraged_returns(idx_ret, rf_ann, lev_max, extra_drag=extra_drag)
+    state = trend_state(close, window=ma)
+    gate = vol_gate_leverage(close, state, lo=vlo, hi=vhi, lev_hi=lev_max)
+    return blended_leverage_backtest(idx_ret, leg, safe_ret, gate, lag=lag,
+                                     cost_3x=cost_hi, cost_1x=cost_1x,
+                                     cost_safe=cost_safe, lev_high=lev_max)["pnl"]
 
 
 def tracking_report(synth: pd.Series, real: pd.Series) -> dict | None:
