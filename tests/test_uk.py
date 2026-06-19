@@ -109,6 +109,17 @@ def test_blended_leverage_maps_to_etp_mix_no_lookahead():
     assert (b3["pnl"].iloc[:2] == 0).all()              # lag: nothing earned yet
 
 
+def test_synth_leverage_extra_drag():
+    idx = _idx(252)
+    flat = pd.Series(0.0, index=idx)
+    base = synth_leveraged_returns(flat, rf_ann=0.05, leverage=3.0, ter=0.0075,
+                                   borrow_spread=0.006)
+    drag = synth_leveraged_returns(flat, rf_ann=0.05, leverage=3.0, ter=0.0075,
+                                   borrow_spread=0.006, extra_drag=0.034)
+    # The empirical haircut subtracts exactly extra_drag/252 per day, on top.
+    assert np.allclose(base - drag, 0.034 / 252)
+
+
 def test_vol_gate_hysteresis_and_gating():
     idx = _idx(600)
     # calm (sig 0.005 ~ 8% ann) -> wild (0.04 ~ 63%) -> mid (0.015 ~ 24%):

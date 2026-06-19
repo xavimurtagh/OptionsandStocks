@@ -30,21 +30,28 @@ import pandas as pd
 
 def synth_leveraged_returns(idx_ret: pd.Series, rf_ann: pd.Series | float,
                             leverage: float, ter: float = 0.0075,
-                            borrow_spread: float = 0.006) -> pd.Series:
+                            borrow_spread: float = 0.006,
+                            extra_drag: float = 0.0) -> pd.Series:
     """Daily-reset L x ETP returns from index returns + financing.
 
-    r_etp = L * r_idx - [(L-1) * (rf + spread) + TER] / 252
+    r_etp = L * r_idx - [(L-1) * (rf + spread) + TER + extra_drag] / 252
 
     The (L-1) notional is borrowed at the short rate plus a swap spread; the
     TER is the fund fee. This is the standard replication of how leveraged
     ETPs are actually built (total-return swaps reset daily), so volatility
     decay emerges from the compounding itself rather than being assumed.
+
+    extra_drag is an annual empirical tracking haircut on top of the modeled
+    financing - the gap between this synthetic and the real product you'd buy.
+    QQQ3.L tracked ~3.4%/yr below the synthetic (5.9% in stress), so haircutting
+    the leveraged leg by that much is the honest way to ask whether the edge
+    survives the actual instrument rather than the idealized one.
     """
     if isinstance(rf_ann, pd.Series):
         rf = rf_ann.reindex(idx_ret.index).ffill().fillna(0.02)
     else:
         rf = pd.Series(float(rf_ann), index=idx_ret.index)
-    drag = ((leverage - 1.0) * (rf + borrow_spread) + ter) / 252.0
+    drag = ((leverage - 1.0) * (rf + borrow_spread) + ter + extra_drag) / 252.0
     return (leverage * idx_ret - drag).clip(lower=-0.99)
 
 
